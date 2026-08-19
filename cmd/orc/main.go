@@ -1,0 +1,482 @@
+// Command orc is the orchestrator CLI: create and run tasks, serve the HTTP
+// API, inspect state, resolve decisions, manage memory.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+
+	"orchestrator/internal/api"
+	"orchestrator/internal/domain"
+	"orchestrator/internal/engine"
+	"orchestrator/internal/executor"
+	"orchestrator/internal/gitws"
+	"orchestrator/internal/memory"
+	"orchestrator/internal/router"
+	"orchestrator/internal/store"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "create":
+		err = cmdCreate(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
+	case "show":
+		err = cmdShow(os.Args[2:])
+	case "events":
+		err = cmdEvents(os.Args[2:])
+	case "resolve":
+		err = cmdResolve(os.Args[2:])
+	case "resume":
+		err = cmdResume(os.Args[2:])
+	case "run":
+		err = cmdRun(os.Args[2:])
+	case "list":
+		err = cmdList(os.Args[2:])
+	case "memory":
+		err = cmdMemory(os.Args[2:])
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `orc — engineering task orchestrator
+
+Usage:
+  orc create --repo <path> [--repo <path>...] --task "<goal>" [flags]
+      --context <text>     extra context (repeatable)
+      --executor <name>    claude | mock            (default claude)
+      --script <file>      scenario file for the mock executor
+      --test-cmd <cmd>     override auto-detected test command
+      --no-run             create the task without executing it
+  orc serve   [--addr :8080]
+  orc list
+  orc show    <task-id>
+  orc events  <task-id> [--after N]
+  orc resolve <task-id> <decision-id> --option <id> [--note "..."]
+  orc resume  <task-id>
+  orc run     <task-id>        start a task created with --no-run (or continue a stopped one)
+  orc memory  add --kind <preference|project_rule|correction> [--scope name] "<text>"
+  orc memory  list
+
+Common flags:
+  --data <dir>   data directory (default ./.orchestrator)
+
+`)
+}
+
+// reorderArgs moves flags (and their values) in front of positional args so
+// `orc show <id> --data X` works; Go's flag package stops at the first
+// positional argument otherwise. boolFlags take no value.
+func reorderArgs(args []string, boolFlags ...string) []string {
+	isBool := map[string]bool{}
+	for _, b := range boolFlags {
+		isBool[b] = true
+	}
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+			name := strings.TrimLeft(a, "-")
+			if !strings.Contains(a, "=") && !isBool[name] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			pos = append(pos, a)
+		}
+	}
+	return append(flags, pos...)
+}
+
+// stringSlice is a repeatable string flag.
+type stringSlice []string
+
+func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
+
+type app struct {
+	eng *engine.Engine
+	mem *memory.FileStore
+}
+
+func buildApp(dataDir, execName, scriptPath string) (*app, error) {
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	st, err := store.NewFileStore(abs)
+	if err != nil {
+		return nil, err
+	}
+	mem, err := memory.NewFileStore(abs)
+	if err != nil {
+		return nil, err
+	}
+	execs := map[string]executor.Executor{
+		"claude": executor.NewClaudeCLI(),
+	}
+	if scriptPath != "" {
+		sc, err := executor.LoadScript(scriptPath)
+		if err != nil {
+			return nil, err
+		}
+		execs["mock"] = sc
+		if execName == "" {
+			execName = "mock"
+		}
+	}
+	if execName == "" {
+		execName = "claude"
+	}
+	if _, ok := execs[execName]; !ok {
+		return nil, fmt.Errorf("executor %q not available (did you forget --script for mock?)", execName)
+	}
+	rt := router.Rules{Executor: execName, CheapModel: "sonnet", StrongModel: "opus"}
+	ws := gitws.NewManager(filepath.Join(abs, "worktrees"))
+	eng := engine.New(st, ws, execs, rt, mem, engine.DefaultConfig())
+	return &app{eng: eng, mem: mem}, nil
+}
+
+func printEvent(ev domain.Event) {
+	data := ""
+	if len(ev.Data) > 0 {
+		b, _ := json.Marshal(ev.Data)
+		data = string(b)
+		if len(data) > 220 {
+			data = data[:220] + "…"
+		}
+	}
+	fmt.Printf("%s  #%-3d %-22s %s\n", ev.At.Local().Format("15:04:05"), ev.Seq, ev.Type, data)
+}
+
+func cmdCreate(args []string) error {
+	fs := flag.NewFlagSet("create", flag.ExitOnError)
+	var repos, ctxSrcs stringSlice
+	fs.Var(&repos, "repo", "repository path (repeatable)")
+	fs.Var(&ctxSrcs, "context", "extra context (repeatable)")
+	task := fs.String("task", "", "engineering task description")
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	execName := fs.String("executor", "", "executor: claude | mock")
+	script := fs.String("script", "", "scenario file for mock executor")
+	testCmd := fs.String("test-cmd", "", "override test command")
+	noRun := fs.Bool("no-run", false, "create without running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	a, err := buildApp(*dataDir, *execName, *script)
+	if err != nil {
+		return err
+	}
+	a.eng.OnEvent = printEvent
+
+	t, err := a.eng.CreateTask(*task, ctxSrcs, repos, *testCmd)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("created task %s\n", t.ID)
+	if *noRun {
+		return nil
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := a.eng.RunTask(ctx, t.ID); err != nil {
+		return err
+	}
+	return printState(a.eng, t.ID)
+}
+
+func printState(eng *engine.Engine, id string) error {
+	fs, err := eng.FullState(id)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Printf("task %s: %s\n", fs.Task.ID, fs.Task.Status)
+	if fs.Task.FailureReason != "" {
+		fmt.Printf("failure: %s\n", fs.Task.FailureReason)
+	}
+	fmt.Printf("confidence: %s\n", fs.Confidence)
+	if len(fs.Task.State.ChangedFiles) > 0 {
+		fmt.Printf("changed files: %s\n", strings.Join(fs.Task.State.ChangedFiles, ", "))
+		fmt.Printf("worktrees: %s (branch %s)\n", fs.Task.State.WorktreeRoot, fs.Task.State.Branch)
+	}
+	fmt.Printf("agent runs: %d, tokens in/out: %d/%d, cost: $%.4f\n",
+		fs.Totals.AgentRuns, fs.Totals.InputTokens, fs.Totals.OutputTokens, fs.Totals.CostUSD)
+	for _, d := range fs.Decisions {
+		if d.Status == "open" {
+			fmt.Printf("\nOPEN DECISION %s [%s]: %s\n", d.ID, d.Importance, d.Question)
+			if d.Recommendation != "" {
+				fmt.Printf("  recommendation: %s\n", d.Recommendation)
+			}
+			for _, o := range d.Options {
+				fmt.Printf("  --option %-10s %s\n", o.ID, o.Label)
+			}
+			fmt.Printf("resolve with: orc resolve %s %s --option <id>\n", fs.Task.ID, d.ID)
+		}
+	}
+	return nil
+}
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", ":8080", "listen address")
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	execName := fs.String("executor", "claude", "executor for LLM roles")
+	script := fs.String("script", "", "scenario file for mock executor")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	a, err := buildApp(*dataDir, *execName, *script)
+	if err != nil {
+		return err
+	}
+	if err := a.eng.RecoverInterrupted(); err != nil {
+		return err
+	}
+	srv := api.New(a.eng)
+	fmt.Printf("orchestrator API on %s (data: %s)\n", *addr, *dataDir)
+	return http.ListenAndServe(*addr, srv.Handler())
+}
+
+func openApp(fs *flag.FlagSet, args []string) (*app, []string, error) {
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	if err := fs.Parse(args); err != nil {
+		return nil, nil, err
+	}
+	a, err := buildApp(*dataDir, "claude", "")
+	return a, fs.Args(), err
+}
+
+func cmdShow(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("show", flag.ExitOnError)
+	a, rest, err := openApp(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) < 1 {
+		return errors.New("usage: orc show <task-id>")
+	}
+	state, err := a.eng.FullState(rest[0])
+	if err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(state, "", "  ")
+	fmt.Println(string(b))
+	return nil
+}
+
+func cmdEvents(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("events", flag.ExitOnError)
+	after := fs.Int64("after", 0, "only events after this seq")
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: orc events <task-id>")
+	}
+	a, err := buildApp(*dataDir, "claude", "")
+	if err != nil {
+		return err
+	}
+	evs, err := a.eng.Store.Events(fs.Arg(0), *after)
+	if err != nil {
+		return err
+	}
+	for _, ev := range evs {
+		printEvent(ev)
+	}
+	return nil
+}
+
+func cmdResolve(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("resolve", flag.ExitOnError)
+	option := fs.String("option", "", "chosen option id")
+	note := fs.String("note", "", "extra guidance")
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	executorName := fs.String("executor", "claude", "executor for continued execution")
+	script := fs.String("script", "", "scenario file for mock executor")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 {
+		return errors.New("usage: orc resolve <task-id> <decision-id> --option <id>")
+	}
+	if *option == "" {
+		return errors.New("--option is required")
+	}
+	a, err := buildApp(*dataDir, *executorName, *script)
+	if err != nil {
+		return err
+	}
+	a.eng.OnEvent = printEvent
+	t, err := a.eng.ResolveDecision(fs.Arg(0), fs.Arg(1), *option, *note)
+	if err != nil {
+		return err
+	}
+	if t.Status.Terminal() {
+		return printState(a.eng, t.ID)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := a.eng.RunTask(ctx, t.ID); err != nil {
+		return err
+	}
+	return printState(a.eng, t.ID)
+}
+
+func cmdResume(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("resume", flag.ExitOnError)
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	executorName := fs.String("executor", "claude", "executor")
+	script := fs.String("script", "", "scenario file for mock executor")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: orc resume <task-id>")
+	}
+	a, err := buildApp(*dataDir, *executorName, *script)
+	if err != nil {
+		return err
+	}
+	a.eng.OnEvent = printEvent
+	if err := a.eng.RecoverInterrupted(); err != nil {
+		return err
+	}
+	t, err := a.eng.Resume(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := a.eng.RunTask(ctx, t.ID); err != nil {
+		return err
+	}
+	return printState(a.eng, t.ID)
+}
+
+func cmdRun(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	executorName := fs.String("executor", "claude", "executor")
+	script := fs.String("script", "", "scenario file for mock executor")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: orc run <task-id>")
+	}
+	a, err := buildApp(*dataDir, *executorName, *script)
+	if err != nil {
+		return err
+	}
+	a.eng.OnEvent = printEvent
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := a.eng.RunTask(ctx, fs.Arg(0)); err != nil {
+		return err
+	}
+	return printState(a.eng, fs.Arg(0))
+}
+
+func cmdList(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	a, _, err := openApp(fs, args)
+	if err != nil {
+		return err
+	}
+	tasks, err := a.eng.Store.ListTasks()
+	if err != nil {
+		return err
+	}
+	for _, t := range tasks {
+		fmt.Printf("%s  %-18s  %s\n", t.ID, t.Status, t.Goal)
+	}
+	return nil
+}
+
+func cmdMemory(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orc memory add|list")
+	}
+	switch args[0] {
+	case "add":
+		fs := flag.NewFlagSet("memory add", flag.ExitOnError)
+		kind := fs.String("kind", "preference", "preference | project_rule | correction")
+		scope := fs.String("scope", "", "repo name/path scope (empty = global)")
+		dataDir := fs.String("data", ".orchestrator", "data directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() < 1 {
+			return errors.New("usage: orc memory add [--kind k] \"text\"")
+		}
+		a, err := buildApp(*dataDir, "claude", "")
+		if err != nil {
+			return err
+		}
+		return a.mem.Add(memory.Item{
+			ID: domain.NewID("mem"), Kind: memory.Kind(*kind), Scope: *scope,
+			Text: strings.Join(fs.Args(), " "), Status: "confirmed",
+		})
+	case "list":
+		fs := flag.NewFlagSet("memory list", flag.ExitOnError)
+		dataDir := fs.String("data", ".orchestrator", "data directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		a, err := buildApp(*dataDir, "claude", "")
+		if err != nil {
+			return err
+		}
+		items, err := a.mem.List("")
+		if err != nil {
+			return err
+		}
+		for _, it := range items {
+			scope := it.Scope
+			if scope == "" {
+				scope = "global"
+			}
+			fmt.Printf("%s  %-12s  %-10s  %s\n", it.ID, it.Kind, scope, it.Text)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown memory subcommand %q", args[0])
+	}
+}

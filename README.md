@@ -1,0 +1,112 @@
+# orc — engineering task orchestrator (prototype)
+
+A working vertical slice of an orchestrator that runs engineering tasks
+through coding agents so the user doesn't have to babysit them. You give it
+git repositories and a task; it researches, implements, verifies with real
+tests, gets an independent review, and records everything as structured
+events, agent runs and evidence — persisted on disk, resumable after restart.
+
+Written in Go, stdlib only. One binary, no external services.
+
+## Quick start
+
+```bash
+go build -o bin/orc ./cmd/orc
+```
+
+### Run a real task with Claude Code
+
+Requires the `claude` CLI installed and authenticated.
+
+```bash
+./bin/orc create \
+  --repo ~/work/project-a \
+  --repo ~/work/shared-lib \
+  --task "Fix incorrect retry behaviour" \
+  --data ./.orchestrator
+```
+
+The CLI streams structured events live and prints the final state:
+which files changed, in which worktrees (your repos are never touched —
+work happens on branch `orc/<task-id>` in isolated git worktrees), the
+confidence level reached, and cost/token totals.
+
+### Run offline (no LLM) with the mock executor
+
+The mock executor replays a scenario file — the entire workflow (worktrees,
+diffs, real `go test` runs, evidence, events) executes for real:
+
+```bash
+./bin/orc create --repo ./some-repo --task "..." \
+  --executor mock --script scenario.json
+```
+
+See `internal/executor/script.go` for the scenario format.
+
+### HTTP API
+
+```bash
+./bin/orc serve --addr :8080 --data ./.orchestrator
+```
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /tasks` | `{"repos": [...], "goal": "...", "context": [...]}` — creates and starts a task |
+| `GET /tasks` | list tasks |
+| `GET /tasks/{id}` | full structured state: task, runs, evidence, decisions, confidence, totals |
+| `GET /tasks/{id}/events?after=N` | event log (poll with `after` for incremental updates) |
+| `GET /tasks/{id}/decisions` | decisions |
+| `POST /tasks/{id}/decisions/{did}/resolve` | `{"option": "id", "note": "..."}` — resolve and continue |
+| `POST /tasks/{id}/resume` | resume an interrupted task |
+
+### Other commands
+
+```bash
+./bin/orc list                       # all tasks
+./bin/orc show <task-id>             # full state as JSON
+./bin/orc events <task-id>           # event log
+./bin/orc resolve <task-id> <dec-id> --option retry --note "try X"
+./bin/orc resume <task-id>           # after a crash/interrupt
+./bin/orc run <task-id>              # start a task created with --no-run
+./bin/orc memory add --kind project_rule "Do not add comments that merely restate code."
+./bin/orc memory list
+```
+
+Memory items (`preference`, `project_rule`) are injected into every agent
+prompt for matching repos.
+
+## How a task flows
+
+```
+UNDERSTAND ──► IMPLEMENT ──► VERIFY ──► REVIEW ──► DONE
+     │              │           │           │
+     │ high         │ blocked/  │ tests     │ changes
+     │ uncertainty  │ uncertain │ fail      │ requested
+     ▼              ▼           ▼           ▼
+INVESTIGATE ◄───────┘      IMPLEMENT   IMPLEMENT
+     │                     (retry,     (with findings)
+     ▼                      escalated
+ IMPLEMENT                  model)
+```
+
+Any step can pause the task on a **structured decision** (question,
+recommendation, options) that a human resolves via CLI or API; repeated
+failures escalate to a decision automatically.
+
+The task's outcome carries an **evidence chain**, not a boolean:
+`assumed → code_inspected → reproduced → implemented → tested → reviewed`.
+"The agent thinks it's fixed" and "tests pass and an independent reviewer
+confirmed" are different confidence levels, and the API reports which one
+you actually have.
+
+## Testing
+
+```bash
+go test ./...
+```
+
+Engine tests run the full workflow against real temp git repositories with
+the mock executor — including failure loops, investigation branches,
+decisions, multi-repo tasks and crash recovery.
+
+See `ARCHITECTURE.md` for design, `NEXT.md` for honest status and next steps.
