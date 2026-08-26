@@ -156,6 +156,99 @@ func (m *Manager) Commit(ctx context.Context, t *domain.Task, message string) (m
 	return out, nil
 }
 
+// ApplyHead moves every worktree branch to ref (resolved in the shared
+// object store of the original repository). Used by verify-only tasks: the
+// baseline ran on the base, now the existing change under review is checked
+// out. Returns repo -> sha.
+func (m *Manager) ApplyHead(ctx context.Context, t *domain.Task, ref string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, r := range t.Repos {
+		dir := filepath.Join(t.State.WorktreeRoot, r.Name)
+		sha, err := git(ctx, dir, "rev-parse", "--verify", ref+"^{commit}")
+		if err != nil {
+			return nil, fmt.Errorf("repo %s: ref %q not found: %w", r.Name, ref, err)
+		}
+		sha = strings.TrimSpace(sha)
+		if _, err := git(ctx, dir, "reset", "-q", "--hard", sha); err != nil {
+			return nil, err
+		}
+		out[r.Name] = sha
+	}
+	return out, nil
+}
+
+// Heads returns the current HEAD per repo worktree and whether any worktree
+// has uncommitted changes. This is the "source state" artifacts are bound to.
+func (m *Manager) Heads(ctx context.Context, t *domain.Task) (map[string]string, bool, error) {
+	heads := map[string]string{}
+	dirty := false
+	for _, r := range t.Repos {
+		dir := filepath.Join(t.State.WorktreeRoot, r.Name)
+		sha, err := git(ctx, dir, "rev-parse", "HEAD")
+		if err != nil {
+			return nil, false, err
+		}
+		heads[r.Name] = strings.TrimSpace(sha)
+		st, err := git(ctx, dir, "status", "--porcelain")
+		if err != nil {
+			return nil, false, err
+		}
+		if strings.TrimSpace(st) != "" {
+			dirty = true
+		}
+	}
+	return heads, dirty, nil
+}
+
+// WithOriginalFiles temporarily restores the base-revision version of the
+// given files (repo-relative "repo/path") in the worktrees, runs fn, then
+// puts the current versions back. Files that did not exist at base are moved
+// aside for the duration. Used to replay the pre-change tests against the
+// changed code.
+func (m *Manager) WithOriginalFiles(ctx context.Context, t *domain.Task, files []string, fn func() error) (err error) {
+	type moved struct{ from, to string }
+	var restoreCheckout = map[string][]string{} // repo -> paths checked out from base
+	var aside []moved
+	defer func() {
+		for repo, paths := range restoreCheckout {
+			dir := filepath.Join(t.State.WorktreeRoot, repo)
+			if _, e := git(ctx, dir, append([]string{"checkout", "HEAD", "--"}, paths...)...); e != nil && err == nil {
+				err = fmt.Errorf("restore %s: %w", repo, e)
+			}
+		}
+		for i := len(aside) - 1; i >= 0; i-- {
+			if e := os.Rename(aside[i].to, aside[i].from); e != nil && err == nil {
+				err = e
+			}
+		}
+	}()
+	for _, f := range files {
+		repo, rel, ok := strings.Cut(f, "/")
+		if !ok {
+			continue
+		}
+		base := t.State.BaseSHAs[repo]
+		dir := filepath.Join(t.State.WorktreeRoot, repo)
+		if _, e := git(ctx, dir, "cat-file", "-e", base+":"+rel); e == nil {
+			if _, e := git(ctx, dir, "checkout", base, "--", rel); e != nil {
+				return e
+			}
+			restoreCheckout[repo] = append(restoreCheckout[repo], rel)
+		} else {
+			from := filepath.Join(dir, filepath.FromSlash(rel))
+			if _, e := os.Stat(from); e != nil {
+				continue // deleted by the change; nothing to hide
+			}
+			to := from + ".orc-aside"
+			if e := os.Rename(from, to); e != nil {
+				return e
+			}
+			aside = append(aside, moved{from, to})
+		}
+	}
+	return fn()
+}
+
 // RepoDir returns the worktree directory of one repo within the task.
 func RepoDir(t *domain.Task, repo domain.RepoRef) string {
 	return filepath.Join(t.State.WorktreeRoot, repo.Name)

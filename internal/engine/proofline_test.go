@@ -124,7 +124,7 @@ func TestProoflineVerticalSlice(t *testing.T) {
 			review++
 		}
 	}
-	if baseline != 2 || after != 2 || diff != 1 || review != 1 {
+	if baseline != 2 || after != 3 || diff != 1 || review != 1 { // narrow repro runs twice (flakiness guard)
 		t.Fatalf("artifacts baseline=%d after=%d diff=%d review=%d", baseline, after, diff, review)
 	}
 

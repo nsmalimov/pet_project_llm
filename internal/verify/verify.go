@@ -60,7 +60,8 @@ func Run(ctx context.Context, repoName, dir, command string, timeout time.Durati
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	effective := Verbose(command)
+	cmd := exec.CommandContext(ctx, "sh", "-c", effective)
 	cmd.Dir = dir
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -68,15 +69,111 @@ func Run(ctx context.Context, repoName, dir, command string, timeout time.Durati
 	err := cmd.Run()
 
 	res := domain.TestResult{Repo: repoName, Command: command, Passed: err == nil}
+	if effective != command {
+		res.Effective = effective
+	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		res.ExitCode = exitErr.ExitCode()
 	} else if err != nil {
 		res.ExitCode = -1
 		out.WriteString("\nrunner error: " + err.Error())
 	}
+	if ctx.Err() == context.DeadlineExceeded {
+		res.TimedOut = true
+		res.Passed = false
+		out.WriteString("\nrunner: timed out after " + timeout.String())
+	}
 	res.OutputTail = tail(out.String(), 4000)
 	res.Output = tail(out.String(), MaxOutput)
+	res.Tests = ParseTests(effective, out.String())
+	res.TestsParsed = res.Tests != nil
 	return res
+}
+
+// Verbose makes known runners report individual test names so the packet
+// can verify that the reproduction test actually executed (exit 0 with the
+// test filtered out, skipped or deleted must not count as verification).
+func Verbose(command string) string {
+	fields := strings.Fields(command)
+	if len(fields) >= 2 && fields[0] == "go" && fields[1] == "test" {
+		for _, f := range fields[2:] {
+			if f == "-v" || f == "-json" {
+				return command
+			}
+		}
+		return "go test -v " + strings.Join(fields[2:], " ")
+	}
+	if isPytest(fields) {
+		for _, f := range fields {
+			if f == "-v" || f == "-vv" || f == "--verbose" {
+				return command
+			}
+		}
+		return command + " -v"
+	}
+	return command
+}
+
+func isPytest(fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	if fields[0] == "pytest" {
+		return true
+	}
+	return len(fields) >= 3 && strings.HasPrefix(fields[0], "python") && fields[1] == "-m" && fields[2] == "pytest"
+}
+
+// ParseTests extracts per-test results from go test -v or pytest -v output.
+// Returns nil when the runner is unknown (the caller must treat test
+// identity as unverifiable).
+func ParseTests(command, output string) []domain.TestCase {
+	fields := strings.Fields(command)
+	var out []domain.TestCase
+	switch {
+	case len(fields) >= 2 && fields[0] == "go" && fields[1] == "test":
+		for _, line := range strings.Split(output, "\n") {
+			l := strings.TrimSpace(line)
+			var st string
+			switch {
+			case strings.HasPrefix(l, "--- PASS: "):
+				st, l = "pass", strings.TrimPrefix(l, "--- PASS: ")
+			case strings.HasPrefix(l, "--- FAIL: "):
+				st, l = "fail", strings.TrimPrefix(l, "--- FAIL: ")
+			case strings.HasPrefix(l, "--- SKIP: "):
+				st, l = "skip", strings.TrimPrefix(l, "--- SKIP: ")
+			default:
+				continue
+			}
+			name := strings.Fields(l)
+			if len(name) > 0 {
+				out = append(out, domain.TestCase{Name: name[0], Status: st})
+			}
+		}
+		if out == nil {
+			out = []domain.TestCase{}
+		}
+		return out
+	case isPytest(fields):
+		for _, line := range strings.Split(output, "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 2 && strings.Contains(f[0], "::") {
+				switch f[1] {
+				case "PASSED":
+					out = append(out, domain.TestCase{Name: f[0], Status: "pass"})
+				case "FAILED", "ERROR":
+					out = append(out, domain.TestCase{Name: f[0], Status: "fail"})
+				case "SKIPPED", "XFAIL":
+					out = append(out, domain.TestCase{Name: f[0], Status: "skip"})
+				}
+			}
+		}
+		if out == nil {
+			out = []domain.TestCase{}
+		}
+		return out
+	}
+	return nil
 }
 
 func tail(s string, n int) string {

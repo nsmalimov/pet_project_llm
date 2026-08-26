@@ -61,6 +61,22 @@ contradicting one means `CONTRADICTED`/`BLOCKED`.
 ./bin/orc serve --addr 127.0.0.1:8080            # then open /cases/<task-id>
 ```
 
+Verify an **existing** change (a PR head, branch or SHA) instead of letting an
+agent write one — the base is the repo's HEAD, the head is verified and
+challenged, no developer runs:
+
+```bash
+./bin/orc verify --repo ./reservations --head fix-branch --pr acme/reservations#7 \
+  --task "Fix duplicate reservation across timezones" \
+  --repro-cmd "go test -run TestReserveRejectsSameUTCDayAcrossTimezones ./..."
+./bin/orc github-status <task-id>          # prints the commit status + PR comment; --post needs GITHUB_TOKEN
+```
+
+Offline scenario suite (real worktrees + real `go test`, scripted agents):
+`scripts/run-scenarios.sh /tmp/scen-data` then `orc serve --data /tmp/scen-data`.
+The matrix of expected vs actual verdicts is in `docs/SCENARIOS.md`;
+adversarial findings in `FALSE_PROOF_REPORT.md`.
+
 Try it on the shipped fixture (real timezone dedup bug, one failing test):
 `scripts/fixture-repo.sh /tmp/reservations`. See `docs/PROOFLINE_SLICE.md`.
 

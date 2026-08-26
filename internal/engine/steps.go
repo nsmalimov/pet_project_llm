@@ -7,6 +7,7 @@ import (
 
 	"orchestrator/internal/domain"
 	"orchestrator/internal/gitws"
+	"orchestrator/internal/proof"
 	"orchestrator/internal/roles"
 	"orchestrator/internal/router"
 	"orchestrator/internal/verify"
@@ -28,6 +29,10 @@ func (e *Engine) stepUnderstand(ctx context.Context, t *domain.Task) error {
 	// Reproduce first: the researcher and the developer both get the real
 	// failing output instead of a description of it.
 	if err := e.runBaseline(ctx, t); err != nil {
+		return err
+	}
+	// Verify-only mode: bring in the existing change before research.
+	if err := e.applyHead(ctx, t); err != nil {
 		return err
 	}
 
@@ -61,6 +66,12 @@ func (e *Engine) stepUnderstand(ctx context.Context, t *domain.Task) error {
 			"action": "investigate", "reason": "research reports high uncertainty → deep investigation before implementing",
 		})
 		return e.setStatus(t, domain.StatusInvestigating)
+	}
+	if t.HeadRef != "" {
+		e.emit(t.ID, domain.EvStepPlanned, map[string]any{
+			"action": "verify", "reason": "verify-only task: the change already exists → run real verification",
+		})
+		return e.setStatus(t, domain.StatusVerifying)
 	}
 	e.emit(t.ID, domain.EvStepPlanned, map[string]any{
 		"action": "implement", "reason": fmt.Sprintf("understanding complete (uncertainty=%s)", out.Uncertainty),
@@ -132,6 +143,18 @@ func (e *Engine) stepInvestigate(ctx context.Context, t *domain.Task) error {
 func (e *Engine) stepImplement(ctx context.Context, t *domain.Task) error {
 	if err := e.ensureWorkspace(ctx, t); err != nil {
 		return err
+	}
+	if t.HeadRef != "" {
+		// Verify-only tasks never modify the change under review.
+		return e.requireDecision(t, &domain.DecisionRequest{
+			Importance: "high",
+			Question:   "The change under verification did not pass; Proofline does not edit external changes. Stop here?",
+			Reason:     "verify-only task (head " + t.HeadRef + ")",
+			Options: []domain.DecisionOption{
+				{ID: "accept", Label: "Record the packet as-is", Effect: "accept"},
+				{ID: "abort", Label: "Abort the task", Effect: "abort"},
+			},
+		}, domain.StatusImplementing, "engine")
 	}
 	rt := e.route(router.Request{
 		Role:        roles.Developer,
@@ -240,27 +263,38 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 		for _, c := range verificationCommands(t, dir) {
 			cmd := c.Cmd
 			ran++
-			e.emit(t.ID, domain.EvTestsStarted, map[string]any{"repo": r.Name, "command": cmd, "narrow": c.Narrow})
-			res := verify.Run(ctx, r.Name, dir, cmd, e.Cfg.TestTimeout)
-			if ctx.Err() != nil {
-				// Cancellation is not a test failure; don't burn a fix attempt.
-				return ctx.Err()
+			repeats := 1
+			if c.Narrow && e.Cfg.RepeatRepro > 1 {
+				repeats = e.Cfg.RepeatRepro // catch a flaky repro that passes once
 			}
-			results = append(results, res)
-			e.addArtifact(t, domain.Artifact{
-				Kind: domain.ArtTestRun, Title: "after change: " + cmd, Repo: r.Name, Command: cmd,
-				ExitCode: res.ExitCode, Passed: boolp(res.Passed), Output: res.Output, Narrow: c.Narrow,
-			})
-			if res.Passed {
-				e.emit(t.ID, domain.EvTestsPassed, map[string]any{"repo": r.Name, "command": cmd})
-			} else {
-				e.emit(t.ID, domain.EvTestsFailed, map[string]any{
-					"repo": r.Name, "command": cmd, "exit_code": res.ExitCode, "output_tail": tailStr(res.OutputTail, 1500),
-				})
+			for i := 1; i <= repeats; i++ {
+				e.emit(t.ID, domain.EvTestsStarted, map[string]any{"repo": r.Name, "command": cmd, "narrow": c.Narrow, "repeat": i})
+				res := verify.Run(ctx, r.Name, dir, cmd, e.Cfg.TestTimeout)
+				if ctx.Err() != nil {
+					// Cancellation is not a test failure; don't burn a fix attempt.
+					return ctx.Err()
+				}
+				results = append(results, res)
+				e.addArtifact(t, runArtifact(domain.ArtTestRun, "after change: "+cmd, res, c.Narrow, i))
+				if res.Passed {
+					e.emit(t.ID, domain.EvTestsPassed, map[string]any{"repo": r.Name, "command": cmd, "repeat": i})
+				} else {
+					e.emit(t.ID, domain.EvTestsFailed, map[string]any{
+						"repo": r.Name, "command": cmd, "exit_code": res.ExitCode, "output_tail": tailStr(res.OutputTail, 1500), "repeat": i,
+					})
+				}
 			}
 		}
 	}
 	t.State.LastTests = results
+
+	// If the author touched test files, replay the ORIGINAL tests against the
+	// changed code. A fix that only satisfies rewritten tests is not verified.
+	if allPassed(results) {
+		if err := e.replayOriginalTests(ctx, t); err != nil {
+			return err
+		}
+	}
 
 	if ran == 0 {
 		e.emit(t.ID, domain.EvTestsSkipped, map[string]any{
@@ -387,6 +421,54 @@ func (e *Engine) stepReview(ctx context.Context, t *domain.Task) error {
 		"action": "implement", "reason": fmt.Sprintf("review requested changes (round %d/%d) → back to implementation", t.State.ReviewRounds, e.Cfg.MaxReviewRounds),
 	})
 	return e.setStatus(t, domain.StatusImplementing)
+}
+
+// replayOriginalTests runs the repro/test commands with the pre-change
+// versions of every changed test file. Records original_tests_run artifacts.
+func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) error {
+	var testFiles []string
+	for _, f := range t.State.ChangedFiles {
+		if proof.IsTestFile(f) {
+			testFiles = append(testFiles, f)
+		}
+	}
+	if len(testFiles) == 0 {
+		return nil
+	}
+	e.emit(t.ID, domain.EvTestsStarted, map[string]any{"replay_original_tests": testFiles})
+	// The replay temporarily swaps files, so capture the source state before
+	// the swap: the artifact describes the committed HEAD, not the swap.
+	heads, dirty, herr := e.WS.Heads(ctx, t)
+	if herr != nil {
+		return herr
+	}
+	var runErr error
+	err := e.WS.WithOriginalFiles(ctx, t, testFiles, func() error {
+		for _, r := range t.Repos {
+			dir := gitws.RepoDir(t, r)
+			for _, c := range verificationCommands(t, dir) {
+				res := verify.Run(ctx, r.Name, dir, c.Cmd, e.Cfg.TestTimeout)
+				if ctx.Err() != nil {
+					runErr = ctx.Err()
+					return nil
+				}
+				a := runArtifact(domain.ArtOriginalTestsRun, "original tests vs changed code: "+c.Cmd, res, c.Narrow, 0)
+				a.Files = testFiles
+				a.SourceSHAs, a.SourceDirty = heads, dirty
+				e.addArtifact(t, a)
+				if !res.Passed {
+					e.emit(t.ID, domain.EvWarning, map[string]any{
+						"warning": "original tests fail against the changed code", "command": c.Cmd, "output_tail": tailStr(res.OutputTail, 1500),
+					})
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("replay original tests: %w", err)
+	}
+	return runErr
 }
 
 func (e *Engine) completeTask(t *domain.Task) error {

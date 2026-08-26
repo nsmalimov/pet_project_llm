@@ -19,6 +19,7 @@ import (
 	"orchestrator/internal/domain"
 	"orchestrator/internal/engine"
 	"orchestrator/internal/executor"
+	"orchestrator/internal/github"
 	"orchestrator/internal/gitws"
 	"orchestrator/internal/memory"
 	"orchestrator/internal/router"
@@ -50,6 +51,10 @@ func main() {
 		err = cmdList(os.Args[2:])
 	case "packet":
 		err = cmdPacket(os.Args[2:])
+	case "verify":
+		err = cmdVerify(os.Args[2:])
+	case "github-status":
+		err = cmdGithubStatus(os.Args[2:])
 	case "decide":
 		err = cmdDecide(os.Args[2:])
 	case "memory":
@@ -86,7 +91,13 @@ Usage:
   orc resolve <task-id> <decision-id> --option <id> [--note "..."]
   orc resume  <task-id>
   orc run     <task-id>        start a task created with --no-run (or continue a stopped one)
+  orc verify  --repo <path> --head <ref> --task "<goal>" [--repro-cmd ...] [--pr owner/repo#N]
+                                   verify an EXISTING change (PR head/branch/sha): baseline on base,
+                                   tests + independent challenge on head, no developer
   orc packet  <task-id> [--json]   change case: verdict, claims, evidence, gaps, risks
+  orc github-status <task-id> [--sha <sha>] [--url <packet-url>] [--post]
+                                   commit status + PR comment for the packet (never a fake green);
+                                   --post needs GITHUB_TOKEN and --pr on the task
   orc decide  <task-id> --decision accept|request_changes|reject [--note "..."]
   orc memory  add --kind <preference|project_rule|correction> [--scope name] "<text>"
   orc memory  list
@@ -569,5 +580,118 @@ func cmdDecide(args []string) error {
 		return err
 	}
 	fmt.Printf("recorded %s on packet v%d (%s)\n", v.Decision, v.PacketVersion, v.ID)
+	return nil
+}
+
+// parsePR parses "owner/repo#N".
+func parsePR(s string) (*domain.PullRequestRef, error) {
+	if s == "" {
+		return nil, nil
+	}
+	repoPart, numPart, ok := strings.Cut(s, "#")
+	owner, repo, ok2 := strings.Cut(repoPart, "/")
+	if !ok || !ok2 || owner == "" || repo == "" {
+		return nil, fmt.Errorf("--pr must be owner/repo#N, got %q", s)
+	}
+	var n int
+	if _, err := fmt.Sscanf(numPart, "%d", &n); err != nil || n <= 0 {
+		return nil, fmt.Errorf("--pr must be owner/repo#N, got %q", s)
+	}
+	return &domain.PullRequestRef{Owner: owner, Repo: repo, Number: n, URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, n)}, nil
+}
+
+// cmdVerify creates and runs a verify-only task for an existing change.
+func cmdVerify(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	var repos, ctxSrcs stringSlice
+	fs.Var(&repos, "repo", "repository path (repeatable)")
+	fs.Var(&ctxSrcs, "context", "extra context (repeatable)")
+	task := fs.String("task", "", "what the change is supposed to do")
+	head := fs.String("head", "", "ref of the change to verify (branch, tag, sha); the repo's HEAD is the base")
+	pr := fs.String("pr", "", "owner/repo#N to link the case to a pull request")
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	execName := fs.String("executor", "", "executor: claude | mock")
+	script := fs.String("script", "", "scenario file for mock executor")
+	testCmd := fs.String("test-cmd", "", "override test command")
+	reproCmd := fs.String("repro-cmd", "", "narrow command expected to fail on base and pass on head")
+	kind := fs.String("kind", "", "bugfix | change")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *head == "" {
+		return errors.New("--head is required")
+	}
+	prRef, err := parsePR(*pr)
+	if err != nil {
+		return err
+	}
+	a, err := buildApp(*dataDir, *execName, *script)
+	if err != nil {
+		return err
+	}
+	a.eng.OnEvent = printEvent
+	t, err := a.eng.CreateTaskSpec(engine.TaskSpec{
+		Goal: *task, Context: ctxSrcs, Repos: repos, TestCommand: *testCmd, ReproCommand: *reproCmd,
+		Kind: domain.TaskKind(*kind), HeadRef: *head, PR: prRef,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("created verify-only task %s (kind=%s, head=%s)\n", t.ID, t.Kind, t.HeadRef)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := a.eng.RunTask(ctx, t.ID); err != nil {
+		return err
+	}
+	return printState(a.eng, t.ID)
+}
+
+// cmdGithubStatus prints (and optionally posts) the commit status and PR
+// comment derived from the packet. Without --post nothing leaves the machine.
+func cmdGithubStatus(args []string) error {
+	args = reorderArgs(args, "post")
+	fs := flag.NewFlagSet("github-status", flag.ExitOnError)
+	sha := fs.String("sha", "", "commit to report on (default: the packet's head SHA)")
+	url := fs.String("url", "", "packet URL to link (default http://127.0.0.1:8080/cases/<id>)")
+	post := fs.Bool("post", false, "POST to GitHub (needs GITHUB_TOKEN and a --pr on the task)")
+	a, rest, err := openApp(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) < 1 {
+		return errors.New("usage: orc github-status <task-id> [--sha ..] [--post]")
+	}
+	v, err := a.eng.PacketState(rest[0])
+	if err != nil {
+		return err
+	}
+	repoName := v.Task.Repos[0].Name
+	target := *sha
+	if target == "" {
+		target = v.Packet.Source.HeadSHAs[repoName]
+	}
+	link := *url
+	if link == "" {
+		link = "http://127.0.0.1:8080/cases/" + v.Task.ID
+	}
+	st := github.BuildStatus(v.Packet, repoName, target, link)
+	comment := github.BuildComment(v.Packet, repoName, target, link)
+	b, _ := json.MarshalIndent(st, "", "  ")
+	fmt.Printf("commit status for %s:\n%s\n\nPR comment:\n%s\n", target, b, comment)
+	if !*post {
+		return nil
+	}
+	if v.Task.PR == nil {
+		return errors.New("task has no --pr link; cannot post")
+	}
+	c := &github.Client{Token: os.Getenv("GITHUB_TOKEN")}
+	ctx := context.Background()
+	if err := c.PostStatus(ctx, v.Task.PR.Owner, v.Task.PR.Repo, target, st); err != nil {
+		return err
+	}
+	if err := c.PostComment(ctx, v.Task.PR.Owner, v.Task.PR.Repo, v.Task.PR.Number, comment); err != nil {
+		return err
+	}
+	fmt.Println("posted")
 	return nil
 }

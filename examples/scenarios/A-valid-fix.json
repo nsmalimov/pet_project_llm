@@ -1,0 +1,19 @@
+{
+ "steps": {
+  "researcher": {
+   "output": "Explored.\n```json\n{\"summary\": \"dayKey formats the caller's local time; the UTC day is not normalised before building the slot key.\", \"key_files\": [\"reservations/store.go\"], \"uncertainty\": \"low\", \"risks\": [\"handler.go passes client zones straight through\"], \"root_cause\": {\"statement\": \"dayKey builds the slot key from the un-normalised local time, so equal UTC days in different zones get different keys\", \"file\": \"reservations/store.go\", \"line\": 33}}\n```"
+  },
+  "developer": {
+   "output": "```json\n{\"status\": \"completed\", \"summary\": \"normalise to UTC in dayKey\", \"files_changed\": [\"reservations/store.go\"]}\n```",
+   "files": [
+    {
+     "path": "reservations/store.go",
+     "content": "// Package reservations is a small in-memory booking store used by the HTTP\n// handler in handler.go. A room can be reserved at most once per calendar\n// day (UTC).\npackage reservations\n\nimport (\n\t\"errors\"\n\t\"sync\"\n\t\"time\"\n)\n\nvar ErrDuplicate = errors.New(\"room already reserved for that day\")\n\ntype Reservation struct {\n\tID   int\n\tRoom string\n\tDay  time.Time\n}\n\ntype Store struct {\n\tmu    sync.Mutex\n\tnext  int\n\tbyKey map[string]Reservation\n}\n\nfunc NewStore() *Store {\n\treturn &Store{byKey: map[string]Reservation{}}\n}\n\n// dayKey identifies a (room, calendar day) slot.\nfunc dayKey(room string, day time.Time) string {\n\treturn room + \"/\" + day.UTC().Format(\"2006-01-02\")\n}\n\n// Reserve books room for the calendar day containing day. It returns\n// ErrDuplicate when that slot is already taken.\nfunc (s *Store) Reserve(room string, day time.Time) (Reservation, error) {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\tkey := dayKey(room, day)\n\tif _, taken := s.byKey[key]; taken {\n\t\treturn Reservation{}, ErrDuplicate\n\t}\n\ts.next++\n\tr := Reservation{ID: s.next, Room: room, Day: day}\n\ts.byKey[key] = r\n\treturn r, nil\n}\n\n// Count returns the number of reservations held.\nfunc (s *Store) Count() int {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\treturn len(s.byKey)\n}\n"
+    }
+   ]
+  },
+  "reviewer": {
+   "output": "```json\n{\"verdict\": \"approve\", \"summary\": \"UTC normalisation closes the gap; key derivation is the only site.\", \"findings\": [{\"severity\": \"low\", \"file\": \"reservations/store.go\", \"issue\": \"stored Day keeps the caller's zone\"}], \"checked\": [\"Reserve key derivation\", \"all three tests traced\", \"only call site of dayKey\"], \"not_checked\": [\"HTTP handler path\", \"concurrent callers\"], \"counterexample\": \"\"}\n```"
+  }
+ }
+}

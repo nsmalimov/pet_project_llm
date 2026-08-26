@@ -46,6 +46,16 @@ type RepoRef struct {
 	Path string `json:"path"` // absolute path to the original repository
 }
 
+// PullRequestRef identifies the GitHub pull request a case was created from.
+type PullRequestRef struct {
+	Owner   string `json:"owner"`
+	Repo    string `json:"repo"`
+	Number  int    `json:"number"`
+	URL     string `json:"url,omitempty"`
+	BaseSHA string `json:"base_sha,omitempty"`
+	HeadSHA string `json:"head_sha,omitempty"`
+}
+
 // TaskKind tells the engine what the baseline is expected to show.
 type TaskKind string
 
@@ -64,6 +74,21 @@ type TestResult struct {
 	// Output is the full captured output (capped by the runner); persisted in
 	// artifacts, not in the task snapshot.
 	Output string `json:"-"`
+	// Effective is the command actually executed (e.g. with -v injected so
+	// individual test names can be verified). Empty = same as Command.
+	Effective string `json:"effective,omitempty"`
+	TimedOut  bool   `json:"timed_out,omitempty"`
+	// Tests lists the individual test cases the runner reported, when the
+	// output format is known (go test -v, pytest -v). TestsParsed says the
+	// runner format was recognised (so an empty list means "no test ran").
+	Tests       []TestCase `json:"tests,omitempty"`
+	TestsParsed bool       `json:"tests_parsed,omitempty"`
+}
+
+// TestCase is one test reported by the runner.
+type TestCase struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // pass | fail | skip
 }
 
 // RootCause is a researcher hypothesis pointing at a concrete location.
@@ -142,12 +167,18 @@ type Task struct {
 	// test command doubles as the reproduction command.
 	ReproCommand string `json:"repro_command,omitempty"`
 	// Kind is "bugfix" (baseline is expected to fail) or "change".
-	Kind          TaskKind   `json:"kind,omitempty"`
-	Status        TaskStatus `json:"status"`
-	FailureReason string     `json:"failure_reason,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	State         TaskState  `json:"state"`
+	Kind TaskKind `json:"kind,omitempty"`
+	// HeadRef switches the task to verify-only mode: no developer runs;
+	// the worktree is moved to this ref (a PR head, a branch, a SHA) after
+	// the baseline and the existing change is verified and challenged.
+	HeadRef string `json:"head_ref,omitempty"`
+	// PR links the case to a pull request when it was created from one.
+	PR            *PullRequestRef `json:"pr,omitempty"`
+	Status        TaskStatus      `json:"status"`
+	FailureReason string          `json:"failure_reason,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	State         TaskState       `json:"state"`
 }
 
 // ---------- Events ----------
@@ -196,6 +227,7 @@ const (
 	EvCommitted         = "workspace.committed"
 	EvPacketBuilt       = "packet.built"
 	EvVerdictRecorded   = "verdict.recorded"
+	EvHeadApplied       = "workspace.head_applied" // verify-only mode: worktree moved to the head ref
 )
 
 // ---------- Decisions ----------
@@ -294,6 +326,10 @@ const (
 	ArtDiff        ArtifactKind = "diff"         // the change itself: files, diff, commits
 	ArtReview      ArtifactKind = "review"       // independent reviewer output
 	ArtRootCause   ArtifactKind = "root_cause"   // researcher hypothesis (agent-reported)
+	// ArtOriginalTestsRun: the pre-change test files replayed against the
+	// changed code. Guards against a fix that only satisfies tests the author
+	// rewrote.
+	ArtOriginalTestsRun ArtifactKind = "original_tests_run"
 )
 
 // Artifact is an immutable, append-only piece of raw evidence.
@@ -306,6 +342,14 @@ type Artifact struct {
 	RunID  string       `json:"run_id,omitempty"` // producing agent run, if any
 	At     time.Time    `json:"at"`
 
+	// Provenance: which engine step produced it, in which workspace, and the
+	// exact source state (worktree HEAD per repo) it was observed against.
+	// Claims only accept artifacts whose SourceSHAs match the current state.
+	Producer     string            `json:"producer,omitempty"`
+	WorktreeRoot string            `json:"worktree_root,omitempty"`
+	SourceSHAs   map[string]string `json:"source_shas,omitempty"`
+	SourceDirty  bool              `json:"source_dirty,omitempty"` // uncommitted changes were present
+
 	// Command runs (baseline_run, test_run).
 	Repo     string `json:"repo,omitempty"`
 	Command  string `json:"command,omitempty"`
@@ -314,7 +358,12 @@ type Artifact struct {
 	Output   string `json:"output,omitempty"`
 	// Narrow reports whether the command is the task's repro command (as
 	// opposed to the full test suite).
-	Narrow bool `json:"narrow,omitempty"`
+	Narrow      bool       `json:"narrow,omitempty"`
+	Effective   string     `json:"effective_command,omitempty"`
+	TimedOut    bool       `json:"timed_out,omitempty"`
+	Tests       []TestCase `json:"tests,omitempty"`
+	TestsParsed bool       `json:"tests_parsed,omitempty"` // false = runner output not parseable
+	Repeat      int        `json:"repeat,omitempty"`       // 1-based index when the same command is run several times
 
 	// Change (diff).
 	Files   []string          `json:"files,omitempty"`
@@ -344,6 +393,9 @@ const (
 	ClaimInsufficient ClaimStatus = "insufficient"
 	ClaimContradicted ClaimStatus = "contradicted"
 	ClaimBlocked      ClaimStatus = "blocked"
+	// ClaimStale: evidence exists but was observed against a source state
+	// that is no longer current. Never counts as supported.
+	ClaimStale ClaimStatus = "stale"
 )
 
 type ClaimType string
@@ -381,6 +433,13 @@ type Risk struct {
 	File     string `json:"file,omitempty"`
 }
 
+// SourceState is the exact code state a packet describes.
+type SourceState struct {
+	BaseSHAs map[string]string `json:"base_shas,omitempty"` // repo -> sha before the change
+	HeadSHAs map[string]string `json:"head_shas,omitempty"` // repo -> worktree HEAD when the packet was built
+	Dirty    bool              `json:"dirty,omitempty"`     // uncommitted changes in a worktree
+}
+
 // ChangeSummary is the "what changed" block of a packet.
 type ChangeSummary struct {
 	Files        []string          `json:"files"`
@@ -402,11 +461,15 @@ type Packet struct {
 	TaskStatus  TaskStatus    `json:"task_status"`
 	Verdict     ClaimStatus   `json:"verdict"` // supported | insufficient | blocked
 	VerdictWhy  string        `json:"verdict_why"`
+	Source      SourceState   `json:"source"`
 	Change      ChangeSummary `json:"change"`
-	Claims      []Claim       `json:"claims"`
-	Gaps        []string      `json:"gaps"`
-	Risks       []Risk        `json:"risks"`
-	Confidence  string        `json:"confidence"` // strongest evidence level (legacy chain)
+	// Contradictions lists claims whose evidence says the opposite, so the
+	// UI can surface them above everything else.
+	Contradictions []string `json:"contradictions"`
+	Claims         []Claim  `json:"claims"`
+	Gaps           []string `json:"gaps"`
+	Risks          []Risk   `json:"risks"`
+	Confidence     string   `json:"confidence"` // strongest evidence level (legacy chain)
 }
 
 // Verdict is the human merge decision on a packet version. It is recorded

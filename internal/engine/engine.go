@@ -32,6 +32,9 @@ type Config struct {
 	MaxInvestigations int           // deep investigations per task
 	AgentTimeout      time.Duration // per agent run
 	TestTimeout       time.Duration // per test command
+	// RepeatRepro is how many times the narrow repro command runs after the
+	// change; disagreeing runs mark the verification flaky (contradicted).
+	RepeatRepro int
 }
 
 func DefaultConfig() Config {
@@ -42,6 +45,7 @@ func DefaultConfig() Config {
 		MaxInvestigations: 2,
 		AgentTimeout:      15 * time.Minute,
 		TestTimeout:       10 * time.Minute,
+		RepeatRepro:       2,
 	}
 }
 

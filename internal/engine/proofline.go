@@ -26,6 +26,8 @@ type TaskSpec struct {
 	TestCommand  string
 	ReproCommand string
 	Kind         domain.TaskKind // empty → inferred from the goal
+	HeadRef      string          // verify-only mode: existing change to verify
+	PR           *domain.PullRequestRef
 }
 
 var bugfixWords = regexp.MustCompile(`(?i)\b(fix|bug|regress|broken|crash|incorrect|wrong|duplicate|fails?|leak|race)\b`)
@@ -50,6 +52,8 @@ func (e *Engine) CreateTaskSpec(spec TaskSpec) (*domain.Task, error) {
 		return nil, err
 	}
 	t.ReproCommand = strings.TrimSpace(spec.ReproCommand)
+	t.HeadRef = strings.TrimSpace(spec.HeadRef)
+	t.PR = spec.PR
 	t.Kind = spec.Kind
 	if t.Kind == "" {
 		t.Kind = InferKind(spec.Goal)
@@ -67,6 +71,17 @@ func (e *Engine) addArtifact(t *domain.Task, a domain.Artifact) domain.Artifact 
 	a.TaskID = t.ID
 	a.Phase = t.Status
 	a.At = time.Now().UTC()
+	a.WorktreeRoot = t.State.WorktreeRoot
+	if a.Producer == "" {
+		a.Producer = "engine." + string(t.Status)
+	}
+	if a.SourceSHAs == nil {
+		// Bind the artifact to the exact source state it was observed on.
+		heads, dirty, err := e.WS.Heads(context.Background(), t)
+		if err == nil {
+			a.SourceSHAs, a.SourceDirty = heads, dirty
+		}
+	}
 	if err := e.Store.AddArtifact(a); err != nil {
 		e.emit(t.ID, domain.EvWarning, map[string]any{"warning": "artifact not persisted", "error": err.Error(), "kind": string(a.Kind)})
 		return a
@@ -76,6 +91,15 @@ func (e *Engine) addArtifact(t *domain.Task, a domain.Artifact) domain.Artifact 
 }
 
 func boolp(b bool) *bool { return &b }
+
+// runArtifact converts a test result into a run artifact.
+func runArtifact(kind domain.ArtifactKind, title string, res domain.TestResult, narrow bool, repeat int) domain.Artifact {
+	return domain.Artifact{
+		Kind: kind, Title: title, Repo: res.Repo, Command: res.Command, Effective: res.Effective,
+		ExitCode: res.ExitCode, Passed: boolp(res.Passed), Output: res.Output, Narrow: narrow,
+		TimedOut: res.TimedOut, Tests: res.Tests, TestsParsed: res.TestsParsed, Repeat: repeat,
+	}
+}
 
 // verificationCommands returns the (command, narrow) pairs to run in a repo:
 // the repro command first when it differs from the test command.
@@ -120,11 +144,7 @@ func (e *Engine) runBaseline(ctx context.Context, t *domain.Task) error {
 				return ctx.Err()
 			}
 			results = append(results, res)
-			title := "baseline: " + c.Cmd
-			e.addArtifact(t, domain.Artifact{
-				Kind: domain.ArtBaselineRun, Title: title, Repo: r.Name, Command: c.Cmd,
-				ExitCode: res.ExitCode, Passed: boolp(res.Passed), Output: res.Output, Narrow: c.Narrow,
-			})
+			e.addArtifact(t, runArtifact(domain.ArtBaselineRun, "baseline: "+c.Cmd, res, c.Narrow, 0))
 			if res.Passed {
 				e.emit(t.ID, domain.EvBaselinePassed, map[string]any{"repo": r.Name, "command": c.Cmd})
 			} else {
@@ -165,10 +185,18 @@ func (e *Engine) snapshotPacket(t *domain.Task) (*domain.Packet, error) {
 	evidence, _ := e.Store.EvidenceList(t.ID)
 	runs, _ := e.Store.Runs(t.ID)
 	decisions, _ := e.Store.Decisions(t.ID)
-	fresh := proof.Build(proof.Input{
+	in := proof.Input{
 		Task: t, Artifacts: arts, Evidence: evidence, Runs: runs, Decisions: decisions,
 		FileExists: proof.WorktreeFileExists(t),
-	})
+	}
+	if t.State.WorktreeRoot != "" {
+		if heads, dirty, err := e.WS.Heads(context.Background(), t); err == nil {
+			in.CurrentSHAs, in.CurrentDirty = heads, dirty
+		} else {
+			in.SourceUnknown = true
+		}
+	}
+	fresh := proof.Build(in)
 	existing, err := e.Store.Packets(t.ID)
 	if err != nil {
 		return nil, err
@@ -297,4 +325,35 @@ func (e *Engine) RecordVerdict(taskID, decision, note, by string) (*domain.Verdi
 		"verdict_id": v.ID, "decision": decision, "packet_version": p.Version, "note": v.Note, "by": by,
 	})
 	return &v, nil
+}
+
+// applyHead (verify-only mode) moves the worktrees to the head ref after the
+// baseline ran on the base, and records the existing change as the diff
+// artifact. No developer runs; the author is external.
+func (e *Engine) applyHead(ctx context.Context, t *domain.Task) error {
+	if t.HeadRef == "" || len(t.State.Commits) > 0 {
+		return nil
+	}
+	shas, err := e.WS.ApplyHead(ctx, t, t.HeadRef)
+	if err != nil {
+		return err
+	}
+	t.State.Commits = shas
+	diff, files, err := e.WS.Diff(ctx, t)
+	if err != nil {
+		return fmt.Errorf("compute diff: %w", err)
+	}
+	t.State.ChangedFiles = files
+	t.State.AuthorModel = "external"
+	e.emit(t.ID, domain.EvHeadApplied, map[string]any{"ref": t.HeadRef, "commits": shas, "files": files})
+	e.emit(t.ID, domain.EvFilesChanged, map[string]any{"files": files, "count": len(files)})
+	if len(files) > 0 {
+		e.addArtifact(t, domain.Artifact{
+			Kind: domain.ArtDiff, Title: fmt.Sprintf("change under review: %d file(s) at %s", len(files), t.HeadRef),
+			Files: files, Diff: diff, Commits: shas, Branch: t.State.Branch, Model: "external",
+			Producer: "engine.head_applied",
+		})
+		e.addEvidence(t, domain.EvidenceImplemented, "an existing change is under verification", "external", fmt.Sprintf("%d file(s) at %s", len(files), t.HeadRef))
+	}
+	return e.Store.SaveTask(t)
 }

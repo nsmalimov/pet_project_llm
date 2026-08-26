@@ -64,7 +64,7 @@ func (c *ClaudeCLI) Run(ctx context.Context, req Request) (Result, error) {
 		// common test runners so an independent reviewer can actually
 		// execute the suite instead of hand-tracing it. No Edit/Write.
 		args = append(args,
-			"--allowedTools", "Read Glob Grep Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git status:*) Bash(go test:*) Bash(go vet:*) Bash(npm test:*) Bash(pytest:*) Bash(python3 -m pytest:*) Bash(make test:*)",
+			"--allowedTools", "Read Glob Grep Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git status:*) Bash(git rev-parse:*) Bash(git ls-files:*) Bash(git branch:*) Bash(git blame:*) Bash(go test:*) Bash(go vet:*) Bash(npm test:*) Bash(pytest:*) Bash(python3 -m pytest:*) Bash(make test:*)",
 			"--disallowedTools", "Edit Write NotebookEdit",
 		)
 	} else {

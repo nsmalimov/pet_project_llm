@@ -46,6 +46,17 @@
 - Packets are append-only versions with a content fingerprint; verdicts pin a
   packet version and are refused while the workflow is running.
 
+Sprint 2 (same day): adversarial pass — see `FALSE_PROOF_REPORT.md`. Every
+artifact is now bound to the worktree HEAD per repo (`source_shas`); claims
+accept only artifacts on the current state, otherwise STALE. `go test`/`pytest`
+run with `-v`, per-test results are persisted and the baseline-failing tests
+must be observed passing. Author-modified test files trigger a replay of the
+original tests against the changed code. Narrow repro runs twice (flaky
+guard). Verify-only mode (`orc verify --head`) for existing changes/PR heads;
+`internal/github` builds statuses/comments that are never a fake green.
+Scenario matrix in `docs/SCENARIOS.md`; honest reviews in
+`PRODUCT_HYPOTHESIS_REVIEW.md` and `DOGFOOD_READINESS.md`.
+
 Known thin spots of the slice:
 - `root_cause_supported` is a cross-check (file named ∧ file modified ∧
   fail→pass), not a proof of causality.

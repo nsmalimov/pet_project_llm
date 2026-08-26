@@ -67,7 +67,8 @@ type createTaskReq struct {
 	Context      []string `json:"context,omitempty"`
 	TestCommand  string   `json:"test_command,omitempty"`
 	ReproCommand string   `json:"repro_command,omitempty"`
-	Kind         string   `json:"kind,omitempty"` // bugfix | change (inferred when empty)
+	Kind         string   `json:"kind,omitempty"`     // bugfix | change (inferred when empty)
+	HeadRef      string   `json:"head_ref,omitempty"` // verify-only mode: existing change to verify
 	// Start controls whether execution begins immediately (default true).
 	Start *bool `json:"start,omitempty"`
 }
@@ -80,7 +81,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := s.Engine.CreateTaskSpec(engine.TaskSpec{
 		Goal: req.Goal, Context: req.Context, Repos: req.Repos,
-		TestCommand: req.TestCommand, ReproCommand: req.ReproCommand, Kind: domain.TaskKind(req.Kind),
+		TestCommand: req.TestCommand, ReproCommand: req.ReproCommand, Kind: domain.TaskKind(req.Kind), HeadRef: req.HeadRef,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
