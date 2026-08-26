@@ -23,6 +23,7 @@ Requires the `claude` CLI installed and authenticated.
   --repo ~/work/project-a \
   --repo ~/work/shared-lib \
   --task "Fix incorrect retry behaviour" \
+  --repro-cmd "go test -run TestRetry ./..." \
   --data ./.orchestrator
 ```
 
@@ -43,6 +44,26 @@ diffs, real `go test` runs, evidence, events) executes for real:
 
 See `internal/executor/script.go` for the scenario format.
 
+### Proofline: the Change Case (claims → evidence → decision)
+
+Every task produces a **proof packet** built strictly from persisted
+artifacts (baseline runs, test runs, diff + commit, reviewer output). Free-form
+agent text is never evidence; a missing artifact means `INSUFFICIENT`, a
+contradicting one means `CONTRADICTED`/`BLOCKED`.
+
+```bash
+# bugfix-shaped task: the repro command must FAIL on the baseline and PASS after
+./bin/orc create --repo ./reservations \
+  --task "Fix duplicate reservation across timezones" \
+  --repro-cmd "go test -run TestReserveRejectsSameUTCDayAcrossTimezones ./..."
+./bin/orc packet <task-id>                       # verdict, claims, gaps, risks
+./bin/orc decide <task-id> --decision request_changes --note "..."
+./bin/orc serve --addr 127.0.0.1:8080            # then open /cases/<task-id>
+```
+
+Try it on the shipped fixture (real timezone dedup bug, one failing test):
+`scripts/fixture-repo.sh /tmp/reservations`. See `docs/PROOFLINE_SLICE.md`.
+
 ### HTTP API
 
 ```bash
@@ -58,6 +79,10 @@ See `internal/executor/script.go` for the scenario format.
 | `GET /tasks/{id}/decisions` | decisions |
 | `POST /tasks/{id}/decisions/{did}/resolve` | `{"option": "id", "note": "..."}` — resolve and continue |
 | `POST /tasks/{id}/resume` | resume an interrupted task |
+| `GET /tasks/{id}/packet` | change case: latest packet + artifacts, verdicts, runs, versions |
+| `GET /tasks/{id}/packet/versions/{v}` | a historical packet version (immutable) |
+| `POST /tasks/{id}/verdict` | `{"decision":"accept|request_changes|reject","note":"..."}` — human merge decision |
+| `GET /` , `GET /cases/{id}` | embedded Change Case UI (reads the API above) |
 
 ### Other commands
 

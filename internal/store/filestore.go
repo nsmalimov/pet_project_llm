@@ -278,6 +278,30 @@ func (s *FileStore) EvidenceList(taskID string) ([]domain.Evidence, error) {
 
 // ---------- decisions ----------
 
+func (s *FileStore) AddArtifact(a domain.Artifact) error {
+	return appendJSONL(filepath.Join(s.taskDir(a.TaskID), "artifacts.jsonl"), a)
+}
+
+func (s *FileStore) Artifacts(taskID string) ([]domain.Artifact, error) {
+	return readJSONL[domain.Artifact](filepath.Join(s.taskDir(taskID), "artifacts.jsonl"))
+}
+
+func (s *FileStore) AddPacket(p domain.Packet) error {
+	return appendJSONL(filepath.Join(s.taskDir(p.TaskID), "packets.jsonl"), p)
+}
+
+func (s *FileStore) Packets(taskID string) ([]domain.Packet, error) {
+	return readJSONL[domain.Packet](filepath.Join(s.taskDir(taskID), "packets.jsonl"))
+}
+
+func (s *FileStore) AddVerdict(v domain.Verdict) error {
+	return appendJSONL(filepath.Join(s.taskDir(v.TaskID), "verdicts.jsonl"), v)
+}
+
+func (s *FileStore) Verdicts(taskID string) ([]domain.Verdict, error) {
+	return readJSONL[domain.Verdict](filepath.Join(s.taskDir(taskID), "verdicts.jsonl"))
+}
+
 func (s *FileStore) decisionsPath(taskID string) string {
 	return filepath.Join(s.taskDir(taskID), "decisions.json")
 }

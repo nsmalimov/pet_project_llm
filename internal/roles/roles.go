@@ -33,6 +33,9 @@ type Input struct {
 	// Researcher (investigation mode)
 	InvestigationQuestion string
 
+	// Researcher / Developer
+	BaselineFailures []domain.TestResult // repro/test runs that failed on the untouched code
+
 	// Developer
 	ResearchSummary string
 	KeyFiles        []string
@@ -80,6 +83,19 @@ func commonHeader(t *domain.Task, rules []string) string {
 	return sb.String()
 }
 
+func baselineBlock(in Input) string {
+	if len(in.BaselineFailures) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("Baseline reproduction (run on the UNCHANGED code before any edit — this is the failing behaviour to fix):\n")
+	for _, f := range in.BaselineFailures {
+		fmt.Fprintf(&sb, "--- repo %s, command `%s` (exit %d):\n%s\n", f.Repo, f.Command, f.ExitCode, f.OutputTail)
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
 const decisionRequestSchema = `"decision_request": null OR {"importance":"low|medium|high","question":"...","recommendation":"...","reason":"...","options":[{"id":"a","label":"...","detail":"..."}]}`
 
 // ResearcherPrompt: understand the codebase(s) well enough for a developer to
@@ -93,6 +109,7 @@ func ResearcherPrompt(in Input) string {
 		sb.WriteString("Mode: initial understanding. Your job is to understand the code well enough that a developer can implement the task safely.\n\n")
 	}
 	sb.WriteString(commonHeader(in.Task, in.Rules))
+	sb.WriteString(baselineBlock(in))
 	if in.InvestigationQuestion != "" {
 		fmt.Fprintf(&sb, "Question to investigate:\n%s\n\n", in.InvestigationQuestion)
 	}
@@ -105,8 +122,11 @@ When done, end your reply with exactly one JSON object in a ` + "```json" + ` fe
   "uncertainty": "low|medium|high",
   "risks": ["..."],
   "open_questions": ["..."],
+  "root_cause": null OR {"statement":"one sentence naming the defect","file":"repoName/path/to/file","line":123},
   ` + decisionRequestSchema + `
 }
+
+root_cause: for a bug, point at the exact file (and line) where the defect lives. Only fill it in if you actually located the defect in the code; otherwise null.
 
 uncertainty=high means: implementing now without more information would likely produce a wrong result.
 Use decision_request ONLY for questions a human must answer (ambiguous product intent, destructive/irreversible choices) — not for things you can find in the code.
@@ -128,6 +148,7 @@ func DeveloperPrompt(in Input) string {
 		}
 		sb.WriteString("\n")
 	}
+	sb.WriteString(baselineBlock(in))
 	if len(in.TestFailures) > 0 {
 		sb.WriteString("Your previous change FAILED verification. Fix the following:\n")
 		for _, f := range in.TestFailures {
@@ -164,7 +185,7 @@ status=uncertain: you made a change but are not confident it is correct.
 // summary, notes or reasoning.
 func ReviewerPrompt(in Input) string {
 	var sb strings.Builder
-	sb.WriteString("You are an independent code Reviewer. You did NOT write this change and you have no access to the author's reasoning — verify everything yourself against the requirements.\n\n")
+	sb.WriteString("You are an independent code Reviewer performing an adversarial challenge. You did NOT write this change and you have no access to the author's reasoning — verify everything yourself against the requirements and actively try to find a counterexample: an input, ordering or environment where the change is still wrong.\n\n")
 	sb.WriteString(commonHeader(in.Task, in.Rules))
 	sb.WriteString("The change under review (diff against the base revision):\n")
 	sb.WriteString("```diff\n" + in.Diff + "\n```\n\n")
@@ -178,11 +199,16 @@ Check:
 
 Request changes only for real problems; do not block on style preferences.
 
+Be explicit about coverage. "checked" lists the concrete things you verified (by reading code or tracing a scenario). "not_checked" lists relevant aspects you did NOT verify (callers you did not trace, concurrency, other services, migrations, performance...). An empty not_checked list is almost never honest.
+
 End your reply with exactly one JSON object in a ` + "```json" + ` fence:
 {
   "verdict": "approve|changes_requested",
   "summary": "your independent assessment",
-  "findings": [{"severity":"high|medium|low","file":"repoName/path","issue":"..."}]
+  "findings": [{"severity":"high|medium|low","file":"repoName/path","issue":"..."}],
+  "checked": ["..."],
+  "not_checked": ["..."],
+  "counterexample": "a concrete scenario that still breaks, or empty"
 }
 `)
 	return sb.String()

@@ -30,6 +30,16 @@ type Store interface {
 	AddEvidence(e domain.Evidence) error
 	EvidenceList(taskID string) ([]domain.Evidence, error)
 
+	AddArtifact(a domain.Artifact) error
+	Artifacts(taskID string) ([]domain.Artifact, error)
+
+	// Packets are append-only versions; Packets returns them in version order.
+	AddPacket(p domain.Packet) error
+	Packets(taskID string) ([]domain.Packet, error)
+
+	AddVerdict(v domain.Verdict) error
+	Verdicts(taskID string) ([]domain.Verdict, error)
+
 	CreateDecision(d *domain.Decision) error
 	SaveDecision(d *domain.Decision) error
 	GetDecision(taskID, id string) (*domain.Decision, error)

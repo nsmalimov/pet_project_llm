@@ -4,16 +4,21 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"orchestrator/internal/domain"
 	"orchestrator/internal/engine"
 	"orchestrator/internal/store"
 )
+
+//go:embed ui.html
+var uiHTML []byte
 
 type Server struct {
 	Engine *engine.Engine
@@ -31,6 +36,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /tasks/{id}/decisions/{did}/resolve", s.resolveDecision)
 	mux.HandleFunc("POST /tasks/{id}/resume", s.resumeTask)
 	mux.HandleFunc("POST /tasks/{id}/run", s.runTask)
+	// Proofline: change case packet + human verdict.
+	mux.HandleFunc("GET /tasks/{id}/packet", s.getPacket)
+	mux.HandleFunc("GET /tasks/{id}/packet/versions/{v}", s.getPacketVersion)
+	mux.HandleFunc("POST /tasks/{id}/verdict", s.postVerdict)
+	mux.HandleFunc("GET /tasks/{id}/verdicts", s.getVerdicts)
+	// UI (static, embedded). Every screen loads its data from the API above.
+	mux.HandleFunc("GET /", s.ui)
+	mux.HandleFunc("GET /cases/{id}", s.ui)
 	return mux
 }
 
@@ -49,10 +62,12 @@ func writeErr(w http.ResponseWriter, err error) {
 }
 
 type createTaskReq struct {
-	Repos       []string `json:"repos"`
-	Goal        string   `json:"goal"`
-	Context     []string `json:"context,omitempty"`
-	TestCommand string   `json:"test_command,omitempty"`
+	Repos        []string `json:"repos"`
+	Goal         string   `json:"goal"`
+	Context      []string `json:"context,omitempty"`
+	TestCommand  string   `json:"test_command,omitempty"`
+	ReproCommand string   `json:"repro_command,omitempty"`
+	Kind         string   `json:"kind,omitempty"` // bugfix | change (inferred when empty)
 	// Start controls whether execution begins immediately (default true).
 	Start *bool `json:"start,omitempty"`
 }
@@ -63,7 +78,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json: " + err.Error()})
 		return
 	}
-	t, err := s.Engine.CreateTask(req.Goal, req.Context, req.Repos, req.TestCommand)
+	t, err := s.Engine.CreateTaskSpec(engine.TaskSpec{
+		Goal: req.Goal, Context: req.Context, Repos: req.Repos,
+		TestCommand: req.TestCommand, ReproCommand: req.ReproCommand, Kind: domain.TaskKind(req.Kind),
+	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -182,4 +200,78 @@ func (s *Server) resumeTask(w http.ResponseWriter, r *http.Request) {
 	}
 	s.runAsync(t.ID)
 	writeJSON(w, http.StatusOK, t)
+}
+
+// ---------- Proofline ----------
+
+func (s *Server) getPacket(w http.ResponseWriter, r *http.Request) {
+	v, err := s.Engine.PacketState(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) getPacketVersion(w http.ResponseWriter, r *http.Request) {
+	n, err := strconv.Atoi(r.PathValue("v"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad version"})
+		return
+	}
+	p, err := s.Engine.PacketVersion(r.PathValue("id"), n)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+type verdictReq struct {
+	Decision string `json:"decision"` // accept | request_changes | reject
+	Note     string `json:"note,omitempty"`
+	By       string `json:"by,omitempty"`
+}
+
+func (s *Server) postVerdict(w http.ResponseWriter, r *http.Request) {
+	var req verdictReq
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json: " + err.Error()})
+		return
+	}
+	v, err := s.Engine.RecordVerdict(r.PathValue("id"), req.Decision, req.Note, req.By)
+	if err != nil {
+		switch {
+		case errors.Is(err, engine.ErrTaskRunning):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		case errors.Is(err, store.ErrNotFound):
+			writeErr(w, err)
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, v)
+}
+
+func (s *Server) getVerdicts(w http.ResponseWriter, r *http.Request) {
+	vs, err := s.Engine.Store.Verdicts(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if vs == nil {
+		vs = []domain.Verdict{}
+	}
+	writeJSON(w, http.StatusOK, vs)
+}
+
+func (s *Server) ui(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && !strings.HasPrefix(r.URL.Path, "/cases/") {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(uiHTML)
 }

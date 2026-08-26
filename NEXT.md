@@ -32,6 +32,31 @@
   populated by the real run; `GET /tasks/{id}` reports the strongest level
   as `confidence`.
 
+## Proofline slice (2026-08-26) — verified by running it
+
+- Real run on `fixtures/reservations` (timezone dedup bug): baseline
+  `go test -run …Timezones` FAIL (exit 1) → sonnet fix in `store.go`, committed
+  `e9a8524` → repro + full suite PASS → opus review approve, 3 low findings,
+  12 checked / 7 explicitly not-checked → packet v1 `SUPPORTED` with 9 gaps
+  → human `request_changes` recorded, survives server restart. 3 runs, $0.58.
+- Claims are derived only from `artifacts.jsonl` (`internal/proof`, pure,
+  unit-tested). Baseline-passes → `problem_reproduced: CONTRADICTED` and
+  verdict `BLOCKED` (tested). Integration / cross-service are always
+  `INSUFFICIENT` — there is no runner; the UI shows them as gaps, on purpose.
+- Packets are append-only versions with a content fingerprint; verdicts pin a
+  packet version and are refused while the workflow is running.
+
+Known thin spots of the slice:
+- `root_cause_supported` is a cross-check (file named ∧ file modified ∧
+  fail→pass), not a proof of causality.
+- If the developer edits test files, the after-change run uses different
+  tests than the baseline; the packet flags it as a risk but still counts the
+  same-command flip.
+- No integration/log/trace runner; no cross-repo test.
+- The reviewer can now run `go test`/`npm test`/`pytest` (allow-listed) but
+  nothing forces it to; `not_checked` is self-reported.
+- UI is one embedded HTML file polling the API; no SSE, no auth.
+
 ## What is fake / stub / thin
 
 - **The router is 40 lines of if-else.** Deliberate: the *interface* carries
@@ -41,9 +66,8 @@
 - **Memory pattern detection does not exist.** Storage + prompt injection of
   confirmed rules works; `correction` items and the `proposed` status are
   dead weight until a detector proposes rules from repeated corrections.
-- **`reproduced` evidence level is never emitted.** The engine never runs
-  tests *before* implementing, so it can't prove a bug was reproduced. Cheap
-  to add: a baseline verify step for bugfix-shaped tasks.
+- ~~`reproduced` evidence level is never emitted.~~ Done: baseline runs
+  before research for every task; bugfix tasks emit `reproduced` on failure.
 - **The Tester role has no LLM mode.** Fine for repos with test suites;
   tasks without one silently skip to review (an event records the skip).
 - **`uncertainty` is self-reported** by the researcher. There is no

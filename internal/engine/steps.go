@@ -25,10 +25,17 @@ func (e *Engine) stepUnderstand(ctx context.Context, t *domain.Task) error {
 	if err := e.ensureWorkspace(ctx, t); err != nil {
 		return err
 	}
+	// Reproduce first: the researcher and the developer both get the real
+	// failing output instead of a description of it.
+	if err := e.runBaseline(ctx, t); err != nil {
+		return err
+	}
 
 	rt := e.route(router.Request{Role: roles.Researcher})
 	e.emitRoute(t, roles.Researcher, rt)
-	prompt := roles.ResearcherPrompt(roles.Input{Task: t, Rules: e.memoryRules(t)})
+	prompt := roles.ResearcherPrompt(roles.Input{
+		Task: t, Rules: e.memoryRules(t), BaselineFailures: failedOnly(t.State.Baseline),
+	})
 	out, run, err := runParsed(e, ctx, t, roles.Researcher, prompt, rt, 0, roles.ParseResearch)
 	if err != nil {
 		return err
@@ -37,8 +44,7 @@ func (e *Engine) stepUnderstand(ctx context.Context, t *domain.Task) error {
 	t.State.Uncertainty = out.Uncertainty
 	t.State.ResearchSummary = out.Summary
 	t.State.KeyFiles = out.KeyFiles
-	e.addEvidence(t, domain.EvidenceCodeInspected,
-		"relevant code inspected and understood", run.ID, out.Summary)
+	e.recordResearch(t, run.ID, out)
 
 	if out.DecisionRequest != nil {
 		e.emit(t.ID, domain.EvStepPlanned, map[string]any{
@@ -106,7 +112,10 @@ func (e *Engine) stepInvestigate(ctx context.Context, t *domain.Task) error {
 	if len(out.KeyFiles) > 0 {
 		t.State.KeyFiles = mergeUnique(t.State.KeyFiles, out.KeyFiles)
 	}
-	e.addEvidence(t, domain.EvidenceCodeInspected, "investigation: "+firstLine(q, 120), run.ID, out.Summary)
+	e.addEvidence(t, domain.EvidenceCodeInspected, "investigation: "+firstLine(q, 120), run.ID, withRisks(out))
+	if out.RootCause != nil {
+		e.recordResearch(t, run.ID, out)
+	}
 
 	if out.DecisionRequest != nil {
 		return e.requireDecision(t, out.DecisionRequest, domain.StatusImplementing, run.ID)
@@ -132,10 +141,11 @@ func (e *Engine) stepImplement(ctx context.Context, t *domain.Task) error {
 	e.emitRoute(t, roles.Developer, rt)
 	prompt := roles.DeveloperPrompt(roles.Input{
 		Task: t, Rules: e.memoryRules(t),
-		ResearchSummary: t.State.ResearchSummary,
-		KeyFiles:        t.State.KeyFiles,
-		TestFailures:    failedOnly(t.State.LastTests),
-		ReviewFindings:  t.State.ReviewFindings,
+		ResearchSummary:  t.State.ResearchSummary,
+		KeyFiles:         t.State.KeyFiles,
+		BaselineFailures: failedOnly(t.State.Baseline),
+		TestFailures:     failedOnly(t.State.LastTests),
+		ReviewFindings:   t.State.ReviewFindings,
 	})
 	out, run, err := runParsed(e, ctx, t, roles.Developer, prompt, rt, t.State.ImplementAttempts, roles.ParseDevelop)
 	if err != nil {
@@ -145,12 +155,26 @@ func (e *Engine) stepImplement(ctx context.Context, t *domain.Task) error {
 	t.State.DeveloperSummary = out.Summary
 	t.State.AuthorModel = rt.Model
 
-	_, files, derr := e.WS.Diff(ctx, t)
+	diff, files, derr := e.WS.Diff(ctx, t)
 	if derr != nil {
 		return fmt.Errorf("compute diff: %w", derr)
 	}
 	t.State.ChangedFiles = files
 	e.emit(t.ID, domain.EvFilesChanged, map[string]any{"files": files, "count": len(files)})
+	if len(files) > 0 {
+		// Pin the change to a commit so the packet references a real SHA.
+		commits, cerr := e.WS.Commit(ctx, t, fmt.Sprintf("orc: %s (attempt %d)", firstLine(t.Goal, 60), t.State.ImplementAttempts))
+		if cerr != nil {
+			e.emit(t.ID, domain.EvWarning, map[string]any{"warning": "could not commit change", "error": cerr.Error()})
+		} else if len(commits) > 0 {
+			t.State.Commits = commits
+			e.emit(t.ID, domain.EvCommitted, map[string]any{"commits": commits})
+		}
+		e.addArtifact(t, domain.Artifact{
+			Kind: domain.ArtDiff, Title: fmt.Sprintf("change: %d file(s)", len(files)), RunID: run.ID,
+			Files: files, Diff: diff, Commits: t.State.Commits, Branch: t.State.Branch, Model: rt.Model,
+		})
+	}
 
 	switch out.Status {
 	case "completed":
@@ -213,27 +237,27 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 	ran := 0
 	for _, r := range t.Repos {
 		dir := gitws.RepoDir(t, r)
-		cmd := t.TestCommand
-		if cmd == "" {
-			cmd = verify.DetectCommand(dir)
-		}
-		if cmd == "" {
-			continue
-		}
-		ran++
-		e.emit(t.ID, domain.EvTestsStarted, map[string]any{"repo": r.Name, "command": cmd})
-		res := verify.Run(ctx, r.Name, dir, cmd, e.Cfg.TestTimeout)
-		if ctx.Err() != nil {
-			// Cancellation is not a test failure; don't burn a fix attempt.
-			return ctx.Err()
-		}
-		results = append(results, res)
-		if res.Passed {
-			e.emit(t.ID, domain.EvTestsPassed, map[string]any{"repo": r.Name, "command": cmd})
-		} else {
-			e.emit(t.ID, domain.EvTestsFailed, map[string]any{
-				"repo": r.Name, "command": cmd, "exit_code": res.ExitCode, "output_tail": tailStr(res.OutputTail, 1500),
+		for _, c := range verificationCommands(t, dir) {
+			cmd := c.Cmd
+			ran++
+			e.emit(t.ID, domain.EvTestsStarted, map[string]any{"repo": r.Name, "command": cmd, "narrow": c.Narrow})
+			res := verify.Run(ctx, r.Name, dir, cmd, e.Cfg.TestTimeout)
+			if ctx.Err() != nil {
+				// Cancellation is not a test failure; don't burn a fix attempt.
+				return ctx.Err()
+			}
+			results = append(results, res)
+			e.addArtifact(t, domain.Artifact{
+				Kind: domain.ArtTestRun, Title: "after change: " + cmd, Repo: r.Name, Command: cmd,
+				ExitCode: res.ExitCode, Passed: boolp(res.Passed), Output: res.Output, Narrow: c.Narrow,
 			})
+			if res.Passed {
+				e.emit(t.ID, domain.EvTestsPassed, map[string]any{"repo": r.Name, "command": cmd})
+			} else {
+				e.emit(t.ID, domain.EvTestsFailed, map[string]any{
+					"repo": r.Name, "command": cmd, "exit_code": res.ExitCode, "output_tail": tailStr(res.OutputTail, 1500),
+				})
+			}
 		}
 	}
 	t.State.LastTests = results
@@ -330,6 +354,13 @@ func (e *Engine) stepReview(ctx context.Context, t *domain.Task) error {
 	}
 	e.emit(t.ID, domain.EvReviewCompleted, map[string]any{
 		"verdict": out.Verdict, "summary": out.Summary, "findings": len(out.Findings),
+		"checked": out.Checked, "not_checked": out.NotChecked,
+	})
+	e.addArtifact(t, domain.Artifact{
+		Kind: domain.ArtReview, Title: "independent review: " + out.Verdict, RunID: run.ID, Model: rt.Model,
+		Verdict: out.Verdict, Summary: out.Summary, Findings: out.Findings,
+		Checked: out.Checked, NotChecked: out.NotChecked, Counterexample: out.Counterexample,
+		Files: files,
 	})
 
 	if out.Verdict == "approve" {
@@ -387,7 +418,35 @@ func (e *Engine) completeTask(t *domain.Task) error {
 		"input_tokens":   inTok,
 		"output_tokens":  outTok,
 	})
+	_, _ = e.snapshotPacket(t)
 	return nil
+}
+
+// recordResearch persists the researcher's findings: code_inspected evidence
+// (with agent-reported risks) and, when present, a root-cause artifact. The
+// artifact is a hypothesis; the packet cross-checks it against the diff.
+func (e *Engine) recordResearch(t *domain.Task, runID string, out *domain.ResearchOutput) {
+	e.addEvidence(t, domain.EvidenceCodeInspected,
+		"relevant code inspected and understood", runID, withRisks(out))
+	if out.RootCause != nil && strings.TrimSpace(out.RootCause.Statement) != "" {
+		t.State.RootCause = out.RootCause
+		e.addArtifact(t, domain.Artifact{
+			Kind: domain.ArtRootCause, Title: "root-cause hypothesis", RunID: runID,
+			RootCause: out.RootCause, Summary: out.Summary,
+		})
+	}
+}
+
+func withRisks(out *domain.ResearchOutput) string {
+	if len(out.Risks) == 0 {
+		return out.Summary
+	}
+	var sb strings.Builder
+	sb.WriteString(out.Summary)
+	for _, r := range out.Risks {
+		sb.WriteString("\nrisk: " + strings.TrimSpace(r))
+	}
+	return sb.String()
 }
 
 // ---------- helpers ----------

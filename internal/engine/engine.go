@@ -222,6 +222,7 @@ func (e *Engine) failTask(t *domain.Task, reason string) error {
 		return err
 	}
 	e.emit(t.ID, domain.EvTaskFailed, map[string]any{"reason": reason})
+	_, _ = e.snapshotPacket(t)
 	return nil
 }
 
@@ -315,7 +316,11 @@ func (e *Engine) requireDecision(t *domain.Task, dr *domain.DecisionRequest, ret
 		"decision_id": d.ID, "importance": d.Importance, "question": d.Question,
 		"recommendation": d.Recommendation, "reason": d.Reason, "options": d.Options, "source": source,
 	})
-	return e.setStatus(t, domain.StatusAwaitingDecision)
+	if err := e.setStatus(t, domain.StatusAwaitingDecision); err != nil {
+		return err
+	}
+	_, _ = e.snapshotPacket(t)
+	return nil
 }
 
 // ResolveDecision records the human's choice and unpauses the workflow.

@@ -60,9 +60,11 @@ func (c *ClaudeCLI) Run(ctx context.Context, req Request) (Result, error) {
 		args = append(args, "--model", req.Model)
 	}
 	if req.ReadOnly {
-		// Read-only roles get search/read tools plus non-mutating git.
+		// Read-only roles get search/read tools, non-mutating git, and the
+		// common test runners so an independent reviewer can actually
+		// execute the suite instead of hand-tracing it. No Edit/Write.
 		args = append(args,
-			"--allowedTools", "Read Glob Grep Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git status:*)",
+			"--allowedTools", "Read Glob Grep Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(git status:*) Bash(go test:*) Bash(go vet:*) Bash(npm test:*) Bash(pytest:*) Bash(python3 -m pytest:*) Bash(make test:*)",
 			"--disallowedTools", "Edit Write NotebookEdit",
 		)
 	} else {

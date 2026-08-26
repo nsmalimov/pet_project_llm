@@ -126,6 +126,36 @@ func (m *Manager) Diff(ctx context.Context, t *domain.Task) (diff string, files 
 	return sb.String(), files, nil
 }
 
+// Commit stages and commits every change in each worktree that has one, so
+// the packet can reference a concrete SHA. Returns repo name -> sha for the
+// repos that received a commit. Repos without changes are skipped.
+func (m *Manager) Commit(ctx context.Context, t *domain.Task, message string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, r := range t.Repos {
+		dir := filepath.Join(t.State.WorktreeRoot, r.Name)
+		if _, err := git(ctx, dir, "add", "-A"); err != nil {
+			return out, err
+		}
+		status, err := git(ctx, dir, "status", "--porcelain")
+		if err != nil {
+			return out, err
+		}
+		if strings.TrimSpace(status) == "" {
+			continue
+		}
+		if _, err := git(ctx, dir, "-c", "user.name=orc", "-c", "user.email=orc@localhost",
+			"commit", "-q", "--no-verify", "-m", message); err != nil {
+			return out, err
+		}
+		sha, err := git(ctx, dir, "rev-parse", "HEAD")
+		if err != nil {
+			return out, err
+		}
+		out[r.Name] = strings.TrimSpace(sha)
+	}
+	return out, nil
+}
+
 // RepoDir returns the worktree directory of one repo within the task.
 func RepoDir(t *domain.Task, repo domain.RepoRef) string {
 	return filepath.Join(t.State.WorktreeRoot, repo.Name)

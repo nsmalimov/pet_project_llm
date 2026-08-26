@@ -48,6 +48,10 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "list":
 		err = cmdList(os.Args[2:])
+	case "packet":
+		err = cmdPacket(os.Args[2:])
+	case "decide":
+		err = cmdDecide(os.Args[2:])
 	case "memory":
 		err = cmdMemory(os.Args[2:])
 	case "-h", "--help", "help":
@@ -72,6 +76,8 @@ Usage:
       --executor <name>    claude | mock            (default claude)
       --script <file>      scenario file for the mock executor
       --test-cmd <cmd>     override auto-detected test command
+      --repro-cmd <cmd>    narrow command that must FAIL before and PASS after the change
+      --kind <kind>        bugfix | change (inferred from the goal when empty)
       --no-run             create the task without executing it
   orc serve   [--addr :8080]
   orc list
@@ -80,6 +86,8 @@ Usage:
   orc resolve <task-id> <decision-id> --option <id> [--note "..."]
   orc resume  <task-id>
   orc run     <task-id>        start a task created with --no-run (or continue a stopped one)
+  orc packet  <task-id> [--json]   change case: verdict, claims, evidence, gaps, risks
+  orc decide  <task-id> --decision accept|request_changes|reject [--note "..."]
   orc memory  add --kind <preference|project_rule|correction> [--scope name] "<text>"
   orc memory  list
 
@@ -185,6 +193,8 @@ func cmdCreate(args []string) error {
 	execName := fs.String("executor", "", "executor: claude | mock")
 	script := fs.String("script", "", "scenario file for mock executor")
 	testCmd := fs.String("test-cmd", "", "override test command")
+	reproCmd := fs.String("repro-cmd", "", "narrow command expected to fail before the change and pass after (e.g. 'go test -run TestX ./...')")
+	kind := fs.String("kind", "", "task kind: bugfix | change (inferred from the goal when empty)")
 	noRun := fs.Bool("no-run", false, "create without running")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -196,11 +206,14 @@ func cmdCreate(args []string) error {
 	}
 	a.eng.OnEvent = printEvent
 
-	t, err := a.eng.CreateTask(*task, ctxSrcs, repos, *testCmd)
+	t, err := a.eng.CreateTaskSpec(engine.TaskSpec{
+		Goal: *task, Context: ctxSrcs, Repos: repos, TestCommand: *testCmd,
+		ReproCommand: *reproCmd, Kind: domain.TaskKind(*kind),
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("created task %s\n", t.ID)
+	fmt.Printf("created task %s (kind=%s)\n", t.ID, t.Kind)
 	if *noRun {
 		return nil
 	}
@@ -479,4 +492,82 @@ func cmdMemory(args []string) error {
 	default:
 		return fmt.Errorf("unknown memory subcommand %q", args[0])
 	}
+}
+
+// cmdPacket prints the change-case packet (claims → evidence → verdict).
+func cmdPacket(args []string) error {
+	args = reorderArgs(args, "json")
+	fs := flag.NewFlagSet("packet", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "print the full packet view as JSON")
+	a, rest, err := openApp(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) < 1 {
+		return errors.New("usage: orc packet <task-id> [--json]")
+	}
+	v, err := a.eng.PacketState(rest[0])
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		b, _ := json.MarshalIndent(v, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	p := v.Packet
+	fmt.Printf("CHANGE CASE %s  %s\n", v.Task.ID, v.Task.Goal)
+	fmt.Printf("VERDICT  %s  — %s  (packet v%d, task %s)\n\n", strings.ToUpper(string(p.Verdict)), p.VerdictWhy, p.Version, v.Task.Status)
+	fmt.Printf("CHANGE   branch %s  commits %v\n         files: %s\n\n", p.Change.Branch, p.Change.Commits, strings.Join(p.Change.Files, ", "))
+	fmt.Println("CLAIMS")
+	for _, c := range p.Claims {
+		fmt.Printf("  %-13s %-24s %s\n", strings.ToUpper(string(c.Status)), c.Title, c.Statement)
+		fmt.Printf("  %-13s %-24s ↳ %s", "", "", c.Reason)
+		if len(c.ArtifactIDs) > 0 {
+			fmt.Printf("  [%s]", strings.Join(c.ArtifactIDs, " "))
+		}
+		fmt.Println()
+	}
+	if len(p.Gaps) > 0 {
+		fmt.Println("\nNOT VERIFIED")
+		for _, g := range p.Gaps {
+			fmt.Println("  ▲ " + g)
+		}
+	}
+	if len(p.Risks) > 0 {
+		fmt.Println("\nUNRESOLVED RISKS")
+		for _, r := range p.Risks {
+			fmt.Printf("  [%s] %s: %s\n", r.Severity, r.Source, r.Text)
+		}
+	}
+	fmt.Println("\nHUMAN DECISION")
+	if len(v.Verdicts) == 0 {
+		fmt.Println("  none yet — orc decide <task-id> --decision accept|request_changes|reject --note '...'")
+	}
+	for _, d := range v.Verdicts {
+		fmt.Printf("  %s on packet v%d at %s  %s\n", strings.ToUpper(d.Decision), d.PacketVersion, d.At.Local().Format("2006-01-02 15:04"), d.Note)
+	}
+	return nil
+}
+
+// cmdDecide records the human merge decision on the current packet.
+func cmdDecide(args []string) error {
+	args = reorderArgs(args)
+	fs := flag.NewFlagSet("decide", flag.ExitOnError)
+	decision := fs.String("decision", "", "accept | request_changes | reject")
+	note := fs.String("note", "", "why")
+	by := fs.String("by", os.Getenv("USER"), "who decides")
+	a, rest, err := openApp(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) < 1 || *decision == "" {
+		return errors.New("usage: orc decide <task-id> --decision accept|request_changes|reject [--note ...]")
+	}
+	v, err := a.eng.RecordVerdict(rest[0], *decision, *note, *by)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("recorded %s on packet v%d (%s)\n", v.Decision, v.PacketVersion, v.ID)
+	return nil
 }

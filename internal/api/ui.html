@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proofline — Change Case</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--ink:#16181d;--muted:#5d6470;--line:#dfe3e8;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--ok:#1f6f43;--ok-bg:#eaf4ee;--warn:#8a5a00;--warn-bg:#fff3d6;--bad:#a11d1d;--bad-bg:#fde8e8;--blk:#5b1f8f;--blk-bg:#f1e8fb;--info:#1d4f8a;--info-bg:#e8f0fb}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--info)}code,pre,.mono{font-family:var(--mono);font-size:12.5px}
+.wrap{max-width:1080px;margin:0 auto;padding:20px 24px 80px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:16px;margin-bottom:12px}
+.top h1{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0}
+.goal{font-size:22px;font-weight:600;margin:4px 0 2px}
+.meta{color:var(--muted);font-size:12.5px}.meta code{color:var(--ink)}
+.band{border-radius:8px;padding:16px 18px;margin:16px 0;display:flex;gap:18px;align-items:flex-start;border:1px solid transparent}
+.band .v{font-size:26px;font-weight:700;letter-spacing:.02em;white-space:nowrap}
+.band .why{font-size:14px}.band .stats{color:inherit;opacity:.85;font-size:12.5px;margin-top:4px}
+.s-supported{background:var(--ok-bg);color:var(--ok);border-color:#bfe0cb}.s-insufficient{background:var(--warn-bg);color:var(--warn);border-color:#f2d58a}
+.s-contradicted,.s-blocked{background:var(--bad-bg);color:var(--bad);border-color:#f0b4b4}.s-running{background:var(--info-bg);color:var(--info);border-color:#b9cdea}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:12px 0}
+.panel h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+.badge{display:inline-block;min-width:112px;text-align:center;padding:2px 8px;border-radius:4px;font-size:11.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.b-supported{background:var(--ok-bg);color:var(--ok)}.b-insufficient{background:var(--warn-bg);color:var(--warn)}.b-contradicted,.b-blocked{background:var(--bad-bg);color:var(--bad)}
+.claim{border-top:1px solid var(--line);padding:10px 0}.claim:first-of-type{border-top:0}
+.claim .row{display:grid;grid-template-columns:120px 200px 1fr 24px;gap:12px;align-items:start;cursor:pointer}
+.claim .title{font-weight:600}.claim .core{font-weight:400;color:var(--muted);font-size:11px;margin-left:6px}
+.claim .stmt{}.claim .reason{color:var(--muted);font-size:12.5px;margin-top:2px}
+.claim .gap{color:var(--warn);font-size:12.5px;margin-top:2px}.claim.insufficient .gap,.claim.contradicted .stmt{font-weight:600}
+.claim.contradicted .stmt,.claim.blocked .stmt{color:var(--bad)}
+.chev{color:var(--muted);text-align:right}
+.ev{margin:10px 0 0 132px;border-left:3px solid var(--line);padding-left:12px}
+.art{margin:8px 0;padding:8px 10px;background:#fafbfc;border:1px solid var(--line);border-radius:6px}
+.art .h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:12.5px}.art .h b{font-size:13px}.art .id{color:var(--muted);font-family:var(--mono);font-size:11px}
+.pass{color:var(--ok);font-weight:700}.fail{color:var(--bad);font-weight:700}
+pre{background:#0f1116;color:#e6e8ee;padding:10px;border-radius:6px;overflow:auto;max-height:360px;margin:8px 0 0;white-space:pre-wrap;word-break:break-word}
+details>summary{cursor:pointer;color:var(--info);font-size:12.5px;user-select:none}
+ul.list{margin:4px 0;padding-left:20px}ul.list li{margin:2px 0}
+.gaps{background:var(--warn-bg);border-color:#f2d58a}.gaps h2{color:var(--warn)}.gaps li{font-weight:600;color:var(--warn)}
+.risk{display:grid;grid-template-columns:70px 190px 1fr;gap:10px;padding:5px 0;border-top:1px solid var(--line)}.risk:first-of-type{border-top:0}
+.sev{font-weight:700;font-size:11px;text-transform:uppercase}.sev-high{color:var(--bad)}.sev-medium{color:var(--warn)}.sev-low,.sev-unknown{color:var(--muted)}
+.src{color:var(--muted);font-size:12px}
+.decide{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.decide textarea{flex:1 1 320px;min-height:56px;border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
+button{font:inherit;font-weight:600;padding:8px 14px;border-radius:6px;border:1px solid var(--line);background:#fff;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}.accept{border-color:var(--ok);color:var(--ok)}.request{border-color:var(--warn);color:var(--warn)}.reject{border-color:var(--bad);color:var(--bad)}
+.recorded{padding:8px 10px;border-radius:6px;background:#f2f4f7;margin:6px 0}.recorded b{text-transform:uppercase}
+.tabs{display:flex;gap:4px;margin-top:20px}.tabs button{border-radius:6px 6px 0 0;border-bottom:0;font-weight:500}.tabs button.on{background:var(--panel);font-weight:700}
+table{border-collapse:collapse;width:100%;font-size:12.5px}th,td{text-align:left;padding:5px 8px;border-top:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600;border-top:0}
+.files code{display:inline-block;margin:2px 6px 2px 0}.tf{color:var(--warn)}
+.err{background:var(--bad-bg);color:var(--bad);padding:10px;border-radius:6px}
+.hidden{display:none}.small{font-size:12px;color:var(--muted)}
+.index a.case{display:block;padding:10px 0;border-top:1px solid var(--line);text-decoration:none;color:inherit}.index a.case:first-of-type{border-top:0}
+.legend{font-size:12px;color:var(--muted);margin-top:8px}.legend span{margin-right:12px}
+</style>
+</head>
+<body><div class="wrap" id="app"><div class="small">loading…</div></div>
+<script>
+const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtMs=ms=>ms>=60000?(ms/60000).toFixed(1)+' min':ms>=1000?(ms/1000).toFixed(1)+' s':ms+' ms';
+const ago=t=>{const d=(Date.now()-new Date(t))/1000;return d<60?Math.round(d)+'s ago':d<3600?Math.round(d/60)+'m ago':d<86400?Math.round(d/3600)+'h ago':new Date(t).toLocaleString()};
+const ACTIVE=new Set(['pending','understanding','investigating','implementing','verifying','reviewing']);
+const open={};let tab='evidence';let timer=null;
+
+async function api(path,opt){const r=await fetch(path,opt);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j}
+
+function route(){const m=location.pathname.match(/^\/cases\/([^/]+)/);if(m)return loadCase(m[1]);return loadIndex()}
+
+async function loadIndex(){
+  try{const tasks=await api('/tasks');
+    const rows=await Promise.all(tasks.sort((a,b)=>b.created_at.localeCompare(a.created_at)).map(async t=>{
+      let v='';try{const p=await api('/tasks/'+t.id+'/packet');v=p.packet.verdict;if(p.verdicts.length)v+=' · human: '+p.verdicts[p.verdicts.length-1].decision}catch(e){v='no packet'}
+      return `<a class="case" href="/cases/${t.id}"><b>${esc(t.goal)}</b><div class="small mono">${t.id} · ${t.kind||'change'} · ${t.status} · ${ago(t.created_at)} · <span class="badge b-${esc(v.split(' ')[0])}">${esc(v)}</span></div></a>`}));
+    $('#app').innerHTML=`<div class="top"><h1>Proofline · change cases</h1></div><div class="panel index">${rows.join('')||'<div class="small">no tasks yet — <code>orc create …</code></div>'}</div>`;
+  }catch(e){$('#app').innerHTML=`<div class="err">${esc(e.message)}</div>`}
+}
+
+async function loadCase(id){
+  let v;try{v=await api('/tasks/'+id+'/packet')}catch(e){$('#app').innerHTML=`<div class="err">${esc(e.message)}</div>`;return}
+  render(v);
+  clearTimeout(timer);if(ACTIVE.has(v.task.status))timer=setTimeout(()=>loadCase(id),3000);
+}
+
+function render(v){
+  for(const k of ['artifacts','verdicts','runs','evidence','decisions','versions'])v[k]=v[k]||[];
+  for(const k of ['claims','gaps','risks'])v.packet[k]=v.packet[k]||[];v.packet.change=v.packet.change||{files:[]};
+  const t=v.task,p=v.packet,arts=Object.fromEntries(v.artifacts.map(a=>[a.id,a]));const active=ACTIVE.has(t.status);
+  const core=p.claims.filter(c=>c.core),coreOk=core.filter(c=>c.status==='supported').length;
+  const bandCls=active?'s-running':'s-'+p.verdict;
+  const verdictText=active?'RUNNING':p.verdict.toUpperCase();
+  const openDec=v.decisions.filter(d=>d.status==='open');
+  const html=`
+  <div class="top"><h1><a href="/">Proofline</a> · change case</h1><span class="small mono">${t.id} · packet v${p.version} · built ${ago(p.built_at)}</span></div>
+  <div class="goal">${esc(t.goal)}</div>
+  <div class="meta">${esc(t.kind||'change')} · ${t.repos.map(r=>`<code>${esc(r.name)}</code> ← ${esc(r.path)}`).join(', ')} · workflow: <b>${esc(t.status)}</b>${t.failure_reason?' — '+esc(t.failure_reason):''}</div>
+
+  <div class="band ${bandCls}"><div class="v">${verdictText}</div><div><div class="why">${esc(active?'the workflow is still executing ('+t.status+'); claims below reflect evidence persisted so far':p.verdict_why)}</div>
+  <div class="stats">${coreOk}/${core.length} core claims supported · <b>${p.gaps.length} not verified</b> · ${p.risks.length} unresolved risk(s) · ${v.verdicts.length?'human decision: <b>'+esc(v.verdicts[v.verdicts.length-1].decision.replace('_',' '))+'</b>':'<b>human decision required</b>'}</div></div></div>
+
+  ${openDec.length?`<div class="panel" style="border-color:#b9cdea"><h2>Workflow paused — the engine needs an answer</h2>${openDec.map(d=>`<div><b>${esc(d.question)}</b><div class="small">${esc(d.reason||'')} ${d.recommendation?'· recommendation: '+esc(d.recommendation):''}</div>
+    <div class="decide" style="margin-top:8px"><textarea id="dnote-${d.id}" placeholder="note / guidance for the agents (optional)"></textarea>${(d.options||[]).map(o=>`<button onclick="resolve('${t.id}','${d.id}','${o.id}')" title="${esc(o.detail||'')}">${esc(o.label)}</button>`).join('')}</div></div>`).join('')}</div>`:''}
+
+  <div class="panel"><h2>Change</h2>
+    <div class="files">${p.change.files.length?p.change.files.map(f=>`<code class="${p.change.test_files?.includes(f)?'tf':''}">${esc(f)}</code>`).join(''):'<span class="small">no files changed yet</span>'}</div>
+    <div class="small" style="margin-top:6px">branch <code>${esc(p.change.branch||'—')}</code> · commit ${p.change.commits?Object.entries(p.change.commits).map(([r,s])=>`<code>${esc(r)}@${esc(s.slice(0,10))}</code>`).join(' '):'<i>none</i>'} · author model <code>${esc(p.change.author_model||'?')}</code>${p.change.test_files?.length?` · <span class="tf">test files modified by the author</span>`:''}
+    ${p.change.diff_artifact?` · <a href="#" onclick="toggle('${p.change.diff_artifact}');return false">diff</a>`:''}</div>
+    ${p.change.diff_artifact?`<div id="ev-${p.change.diff_artifact}" class="${open[p.change.diff_artifact]?'':'hidden'}">${renderArt(arts[p.change.diff_artifact])}</div>`:''}
+  </div>
+
+  <div class="panel"><h2>Claims → evidence</h2>
+    ${p.claims.map(c=>renderClaim(c,arts)).join('')}
+    <div class="legend"><span><b>SUPPORTED</b> a persisted artifact proves it</span><span><b>INSUFFICIENT</b> no artifact — not checked or not provable</span><span><b>CONTRADICTED</b> an artifact says the opposite</span><span><b>core</b> counts toward the verdict</span></div>
+  </div>
+
+  <div class="panel gaps"><h2>Not verified</h2>${p.gaps.length?`<ul class="list">${p.gaps.map(g=>`<li>${esc(g)}</li>`).join('')}</ul>`:'<div class="small">nothing recorded as unverified — be suspicious</div>'}</div>
+
+  <div class="panel"><h2>Unresolved risks</h2>${p.risks.length?p.risks.map(r=>`<div class="risk"><span class="sev sev-${esc(r.severity)}">${esc(r.severity)}</span><span class="src">${esc(r.source)}${r.file?'<br><code>'+esc(r.file)+'</code>':''}</span><span>${esc(r.text)}</span></div>`).join(''):'<div class="small">none recorded</div>'}</div>
+
+  <div class="panel"><h2>Human decision</h2>
+    ${v.verdicts.map(d=>`<div class="recorded"><b>${esc(d.decision.replace('_',' '))}</b> on packet v${d.packet_version} · ${esc(d.by||'')} · ${new Date(d.at).toLocaleString()}${d.note?'<br>'+esc(d.note):''}</div>`).join('')}
+    <div class="decide"><textarea id="note" placeholder="why (recorded with the decision)"></textarea>
+      <button class="accept" ${active?'disabled':''} onclick="decide('${t.id}','accept')">Accept</button>
+      <button class="request" ${active?'disabled':''} onclick="decide('${t.id}','request_changes')">Request changes</button>
+      <button class="reject" ${active?'disabled':''} onclick="decide('${t.id}','reject')">Reject</button></div>
+    <div class="small" style="margin-top:6px">${active?'available once the workflow stops':'the decision is stored separately from any agent verdict and pinned to packet v'+p.version}</div>
+  </div>
+
+  <div class="tabs"><button class="${tab==='evidence'?'on':''}" onclick="setTab('evidence')">Agent runs (${v.runs.length})</button><button class="${tab==='events'?'on':''}" onclick="setTab('events')">Events</button><button class="${tab==='artifacts'?'on':''}" onclick="setTab('artifacts')">All artifacts (${v.artifacts.length})</button><button class="${tab==='versions'?'on':''}" onclick="setTab('versions')">Packet versions (${v.versions.length})</button></div>
+  <div class="panel" style="margin-top:0;border-radius:0 8px 8px 8px" id="raw">${renderTab(v,arts)}</div>`;
+  $('#app').innerHTML=html;
+}
+
+function renderClaim(c,arts){
+  const isOpen=!!open['c-'+c.type];
+  return `<div class="claim ${c.status}"><div class="row" onclick="toggle('c-${c.type}')">
+    <span class="badge b-${c.status}">${c.status}</span>
+    <span class="title">${esc(c.title)}${c.core?'<span class="core">core</span>':''}</span>
+    <span><div class="stmt">${esc(c.statement)}</div><div class="reason">${esc(c.reason)}</div>${c.gap?`<div class="gap">▲ missing: ${esc(c.gap)}</div>`:''}</span>
+    <span class="chev">${isOpen?'▾':'▸'}</span></div>
+    <div id="ev-c-${c.type}" class="ev ${isOpen?'':'hidden'}">${c.artifact_ids?.length?[...new Set(c.artifact_ids)].map(id=>renderArt(arts[id])).join(''):'<div class="small">no artifact backs this claim</div>'}</div></div>`;
+}
+
+function renderArt(a){
+  if(!a)return '<div class="small">artifact missing</div>';
+  const head=`<div class="h"><b>${esc(a.title)}</b><span class="small">${esc(a.kind)} · ${esc(a.phase||'')} · ${new Date(a.at).toLocaleString()}</span><span class="id">${a.id}${a.run_id?' · run '+a.run_id:''}</span></div>`;
+  switch(a.kind){
+    case 'baseline_run':case 'test_run':
+      return `<div class="art">${head}<div style="margin-top:4px"><code>${esc(a.repo)} $ ${esc(a.command)}</code> → <span class="${a.passed?'pass':'fail'}">${a.passed?'PASS':'FAIL'}</span> (exit ${a.exit_code})${a.narrow?' · narrow repro command':''}</div><details><summary>output (${(a.output||'').length} chars)</summary><pre>${esc(a.output||'(empty)')}</pre></details></div>`;
+    case 'diff':
+      return `<div class="art">${head}<div class="files" style="margin-top:4px">${(a.files||[]).map(f=>`<code>${esc(f)}</code>`).join('')}</div><div class="small">commits ${a.commits?Object.entries(a.commits).map(([r,s])=>r+'@'+s.slice(0,10)).join(', '):'none'} · model ${esc(a.model||'?')}</div><details><summary>diff (${(a.diff||'').length} chars)</summary><pre>${esc(a.diff)}</pre></details></div>`;
+    case 'review':
+      return `<div class="art">${head}<div style="margin-top:4px">verdict <b>${esc(a.verdict)}</b> · model <code>${esc(a.model||'?')}</code> · author reasoning withheld</div><div class="small" style="margin-top:4px">${esc(a.summary)}</div>
+        ${a.findings?.length?`<div style="margin-top:6px"><b>findings</b><ul class="list">${a.findings.map(f=>`<li><span class="sev sev-${esc(f.severity)}">${esc(f.severity)}</span> <code>${esc(f.file)}</code> ${esc(f.issue)}</li>`).join('')}</ul></div>`:'<div class="small">no findings</div>'}
+        ${a.counterexample?`<div class="gap" style="margin-top:6px;color:var(--bad)"><b>counterexample:</b> ${esc(a.counterexample)}</div>`:''}
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px"><div><b class="pass">checked</b><ul class="list">${(a.checked||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li class="small">reviewer listed nothing</li>'}</ul></div><div><b style="color:var(--warn)">not checked</b><ul class="list">${(a.not_checked||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li class="small">reviewer listed nothing — treat coverage as unknown</li>'}</ul></div></div></div>`;
+    case 'root_cause':
+      return `<div class="art">${head}<div style="margin-top:4px"><b>${esc(a.root_cause?.statement)}</b> ${a.root_cause?.file?`<code>${esc(a.root_cause.file)}${a.root_cause.line?':'+a.root_cause.line:''}</code>`:''}</div><div class="small">agent-reported hypothesis — supported only when cross-checked against the diff and the test flip</div><details><summary>researcher summary</summary><pre>${esc(a.summary)}</pre></details></div>`;
+  }
+  return `<div class="art">${head}<pre>${esc(JSON.stringify(a,null,2))}</pre></div>`;
+}
+
+function renderTab(v,arts){
+  if(tab==='evidence')return `<table><tr><th>run</th><th>role</th><th>phase</th><th>executor / model</th><th>route reason</th><th>status</th><th>duration</th><th>cost</th></tr>${v.runs.map(r=>`<tr><td class="mono">${r.id}</td><td>${esc(r.role)}</td><td>${esc(r.phase)}</td><td>${esc(r.executor)} / ${esc(r.model||'')}</td><td class="small">${esc(r.route_reason||'')}</td><td>${esc(r.status)}${r.error?' — '+esc(r.error):''}</td><td>${fmtMs(r.duration_ms)}</td><td>$${(r.cost_usd||0).toFixed(3)}</td></tr>`).join('')}</table>
+    <div class="small" style="margin-top:8px">totals: ${v.totals.agent_runs} runs · ${fmtMs(v.totals.duration_ms)} · $${v.totals.cost_usd.toFixed(3)} · ${v.totals.input_tokens} in / ${v.totals.output_tokens} out tokens</div>
+    <h2 style="margin-top:14px">evidence chain (legacy levels)</h2><table><tr><th>level</th><th>claim</th><th>source</th><th>at</th></tr>${v.evidence.map(e=>`<tr><td><code>${esc(e.level)}</code></td><td>${esc(e.claim)}</td><td class="mono">${esc(e.source)}</td><td class="small">${new Date(e.at).toLocaleString()}</td></tr>`).join('')}</table>`;
+  if(tab==='artifacts')return v.artifacts.map(a=>renderArt(a)).join('')||'<div class="small">none</div>';
+  if(tab==='versions')return `<table><tr><th>v</th><th>verdict</th><th>task status</th><th>built</th><th>fingerprint</th><th></th></tr>${v.versions.map(x=>`<tr><td>${x.version}</td><td><span class="badge b-${x.verdict}">${x.verdict}</span></td><td>${esc(x.task_status)}</td><td class="small">${new Date(x.built_at).toLocaleString()}</td><td class="mono">${x.fingerprint}</td><td><a href="/tasks/${v.task.id}/packet/versions/${x.version}" target="_blank">json</a></td></tr>`).join('')}</table><div class="small" style="margin-top:6px">a version is appended only when the packet content changes; older versions are never rewritten</div>`;
+  return `<div id="events" class="small">loading events…</div>`;
+}
+
+async function loadEvents(id){const evs=await api('/tasks/'+id+'/events');const el=$('#events');if(!el)return;
+  el.innerHTML=`<table><tr><th>#</th><th>at</th><th>type</th><th>data</th></tr>${evs.map(e=>`<tr><td>${e.seq}</td><td>${new Date(e.at).toLocaleTimeString()}</td><td><code>${esc(e.type)}</code></td><td class="mono small">${esc(JSON.stringify(e.data||{})).slice(0,400)}</td></tr>`).join('')}</table>`}
+
+function toggle(id){open[id]=!open[id];const el=document.getElementById('ev-'+id);if(el)el.classList.toggle('hidden',!open[id]);const m=location.pathname.match(/^\/cases\/([^/]+)/);if(m&&id.startsWith('c-'))loadCase(m[1])}
+function setTab(t){tab=t;route()}
+async function decide(id,decision){const note=$('#note').value;try{await api('/tasks/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,note,by:'ui'})});await loadCase(id)}catch(e){alert(e.message)}}
+async function resolve(id,did,opt){const note=($('#dnote-'+did)||{}).value||'';try{await api('/tasks/'+id+'/decisions/'+did+'/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({option:opt,note})});await loadCase(id)}catch(e){alert(e.message)}}
+
+const _render=render;render=function(v){_render(v);if(tab==='events')loadEvents(v.task.id)};
+route();
+</script>
+</body></html>

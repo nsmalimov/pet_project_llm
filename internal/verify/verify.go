@@ -49,6 +49,9 @@ func DetectCommand(dir string) string {
 	return ""
 }
 
+// MaxOutput caps the full output kept in artifacts.
+const MaxOutput = 256 * 1024
+
 // Run executes command (via sh -c) in dir and returns a TestResult.
 func Run(ctx context.Context, repoName, dir, command string, timeout time.Duration) domain.TestResult {
 	if timeout == 0 {
@@ -72,6 +75,7 @@ func Run(ctx context.Context, repoName, dir, command string, timeout time.Durati
 		out.WriteString("\nrunner error: " + err.Error())
 	}
 	res.OutputTail = tail(out.String(), 4000)
+	res.Output = tail(out.String(), MaxOutput)
 	return res
 }
 
