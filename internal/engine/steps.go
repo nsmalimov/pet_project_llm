@@ -253,8 +253,17 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 	if err := e.ensureWorkspace(ctx, t); err != nil {
 		return err
 	}
+	if v, err := e.WS.Scan(t); err != nil {
+		return err
+	} else if len(v) > 0 {
+		return fmt.Errorf("%w: after implementation: %s", gitws.ErrHostileRepo, v[0].Path+" "+v[0].Reason)
+	}
 	rt := e.route(router.Request{Role: roles.Tester})
 	e.emitRoute(t, roles.Tester, rt)
+	heads, dirty, err := e.WS.Heads(ctx, t)
+	if err != nil {
+		return err
+	}
 
 	var results []domain.TestResult
 	ran := 0
@@ -269,13 +278,15 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 			}
 			for i := 1; i <= repeats; i++ {
 				e.emit(t.ID, domain.EvTestsStarted, map[string]any{"repo": r.Name, "command": cmd, "narrow": c.Narrow, "repeat": i})
-				res := verify.Run(ctx, r.Name, dir, cmd, e.Cfg.TestTimeout)
+				res := verify.Run(ctx, e.Policy, r.Name, dir, cmd, e.Cfg.TestTimeout)
 				if ctx.Err() != nil {
 					// Cancellation is not a test failure; don't burn a fix attempt.
 					return ctx.Err()
 				}
 				results = append(results, res)
-				e.addArtifact(t, runArtifact(domain.ArtTestRun, "after change: "+cmd, res, c.Narrow, i))
+				a := runArtifact(domain.ArtTestRun, "after change: "+cmd, res, c.Narrow, i)
+				e.bindSource(ctx, t, &a, heads, dirty)
+				e.addArtifact(t, a)
 				if res.Passed {
 					e.emit(t.ID, domain.EvTestsPassed, map[string]any{"repo": r.Name, "command": cmd, "repeat": i})
 				} else {
@@ -447,7 +458,7 @@ func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) error 
 		for _, r := range t.Repos {
 			dir := gitws.RepoDir(t, r)
 			for _, c := range verificationCommands(t, dir) {
-				res := verify.Run(ctx, r.Name, dir, c.Cmd, e.Cfg.TestTimeout)
+				res := verify.Run(ctx, e.Policy, r.Name, dir, c.Cmd, e.Cfg.TestTimeout)
 				if ctx.Err() != nil {
 					runErr = ctx.Err()
 					return nil

@@ -183,6 +183,17 @@ func (b *builder) change() {
 	}
 }
 
+// ---------- claim policies (explicit, human-readable, part of the packet) ----------
+
+const (
+	PolicyReproduced = "SUPPORTED only if a baseline_run artifact of the reproduction command, observed on the recorded base SHAs, exited non-zero with at least one failing test case (when the runner is parseable) and did not time out; a passing baseline is CONTRADICTED."
+	PolicyRootCause  = "SUPPORTED only as a cross-check: the researcher named a file that exists, the diff modifies that file, and the reproduction flipped fail→pass on the current state. Never a causal proof."
+	PolicyVerified   = "SUPPORTED only if the diff artifact and every test_run artifact are on the current source state (no dirty tree), all runs passed without timeout, repeated runs agree, at least one test executed, output was not truncated, every test that failed on the baseline was observed passing, and — if the author modified test files — the original tests replayed against the change also pass."
+	PolicyChallenge  = "SUPPORTED only if a review artifact on the current state has verdict=approve, no counterexample, no high-severity finding, a model different from the author's, and a non-empty list of checked aspects. Means 'no counterexample found', not 'correct'."
+	PolicyIntegrate  = "SUPPORTED only if an integration check artifact exists on the current state. No runner is configured in this build, so this claim is always INSUFFICIENT."
+	PolicyCross      = "SUPPORTED only if a cross-repository verification artifact exists. None can be produced in this build, so this claim is always INSUFFICIENT."
+)
+
 // ---------- claims ----------
 
 // reproCommand is the command whose baseline failure counts as reproduction:
@@ -202,7 +213,7 @@ func (b *builder) reproArtifacts(list []domain.Artifact) []domain.Artifact {
 }
 
 func (b *builder) claimReproduced() domain.Claim {
-	c := domain.Claim{Type: domain.ClaimProblemReproduced, Title: "Problem reproduced", Core: b.t.Kind == domain.KindBugfix}
+	c := domain.Claim{Type: domain.ClaimProblemReproduced, Title: "Problem reproduced", Core: b.t.Kind == domain.KindBugfix, Policy: PolicyReproduced}
 	if b.t.Kind != domain.KindBugfix {
 		c.Status = domain.ClaimInsufficient
 		c.Statement = "Not a bugfix task; no failing behaviour was expected on the baseline."
@@ -241,6 +252,7 @@ func (b *builder) claimReproduced() domain.Claim {
 		c.Gap = "a repro command / test that fails before the change"
 		return c
 	}
+	c.Scope = fmt.Sprintf("repo %s, command `%s`", a.Repo, a.Command)
 	if a.TimedOut {
 		c.Status = domain.ClaimInsufficient
 		c.Statement = fmt.Sprintf("`%s` timed out on the unchanged code.", a.Command)
@@ -267,7 +279,7 @@ func (b *builder) claimReproduced() domain.Claim {
 }
 
 func (b *builder) claimRootCause() domain.Claim {
-	c := domain.Claim{Type: domain.ClaimRootCauseSupported, Title: "Root cause supported", Core: b.t.Kind == domain.KindBugfix}
+	c := domain.Claim{Type: domain.ClaimRootCauseSupported, Title: "Root cause supported", Core: b.t.Kind == domain.KindBugfix, Policy: PolicyRootCause}
 	rc := b.rootCause
 	if rc == nil || rc.RootCause == nil || strings.TrimSpace(rc.RootCause.Statement) == "" {
 		c.Status = domain.ClaimInsufficient
@@ -348,7 +360,7 @@ func (b *builder) baselineFailedThenPassed() (bool, []string) {
 }
 
 func (b *builder) claimChangeVerified() domain.Claim {
-	c := domain.Claim{Type: domain.ClaimChangeVerified, Title: "Change verified", Core: true}
+	c := domain.Claim{Type: domain.ClaimChangeVerified, Title: "Change verified", Core: true, Policy: PolicyVerified}
 	if b.diff == nil || len(b.diff.Files) == 0 {
 		c.Status = domain.ClaimInsufficient
 		c.Statement = "No change exists."
@@ -432,6 +444,16 @@ func (b *builder) claimChangeVerified() domain.Claim {
 		c.Gap = "a passing run"
 		return c
 	}
+	// Completeness: a capped output cannot prove which tests ran.
+	for _, a := range b.tests {
+		if a.Truncated {
+			c.Status = domain.ClaimInsufficient
+			c.Statement = fmt.Sprintf("`%s` passed but its output was truncated by the artifact cap.", a.Command)
+			c.Reason = "incomplete artifact: per-test results cannot be trusted"
+			c.Gap = "a run whose full output fits the cap (narrow the command)"
+			return c
+		}
+	}
 	// Every run passed. Did anything actually execute?
 	for _, a := range b.tests {
 		if a.Tests != nil && len(a.Tests) == 0 {
@@ -447,6 +469,7 @@ func (b *builder) claimChangeVerified() domain.Claim {
 		cmds = append(cmds, "`"+group[0].Command+"`")
 	}
 	sort.Strings(cmds)
+	c.Scope = "commands " + strings.Join(cmds, ", ") + " in the task worktree(s); nothing outside them"
 
 	// Author-modified tests: the original tests must still pass on the fix.
 	if len(b.p.Change.TestFiles) > 0 {
@@ -536,7 +559,7 @@ func (b *builder) missingReproTests() string {
 }
 
 func (b *builder) claimChallenge() domain.Claim {
-	c := domain.Claim{Type: domain.ClaimIndependentChallenge, Title: "Independent challenge", Core: true}
+	c := domain.Claim{Type: domain.ClaimIndependentChallenge, Title: "Independent challenge", Core: true, Policy: PolicyChallenge}
 	r := b.review
 	if r == nil {
 		c.Status = domain.ClaimInsufficient
@@ -600,7 +623,7 @@ func (b *builder) claimChallenge() domain.Claim {
 
 func claimIntegration() domain.Claim {
 	return domain.Claim{
-		Type: domain.ClaimIntegrationChecked, Title: "Integration checked", Core: false,
+		Type: domain.ClaimIntegrationChecked, Title: "Integration checked", Core: false, Policy: PolicyIntegrate,
 		Status:    domain.ClaimInsufficient,
 		Statement: "No integration, log or trace check was executed.",
 		Reason:    "this deployment has no integration check runner configured",
@@ -609,7 +632,7 @@ func claimIntegration() domain.Claim {
 }
 
 func (b *builder) claimCrossService() domain.Claim {
-	c := domain.Claim{Type: domain.ClaimCrossServiceImpact, Title: "Cross-service impact", Core: false, Status: domain.ClaimInsufficient}
+	c := domain.Claim{Type: domain.ClaimCrossServiceImpact, Title: "Cross-service impact", Core: false, Status: domain.ClaimInsufficient, Policy: PolicyCross}
 	if len(b.t.Repos) <= 1 {
 		c.Statement = "Only one repository was in scope; callers outside it were not examined."
 		c.Reason = "no other repository was part of the task"

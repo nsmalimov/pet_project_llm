@@ -59,9 +59,8 @@ func (s *ScriptExecutor) Run(_ context.Context, req Request) (Result, error) {
 	if !ok {
 		return Result{}, fmt.Errorf("mock executor: no scripted step for role %q (attempt %d)", req.Role, req.Attempt)
 	}
-	if step.Fail != "" {
-		return Result{}, fmt.Errorf("mock executor: scripted failure: %s", step.Fail)
-	}
+	// Files are written before a scripted failure so a "crash after editing"
+	// can be simulated (the realistic shape of a dead agent process).
 	for _, f := range step.Files {
 		if req.ReadOnly {
 			return Result{}, fmt.Errorf("mock executor: scenario writes files but role %s is read-only", req.Role)
@@ -76,6 +75,9 @@ func (s *ScriptExecutor) Run(_ context.Context, req Request) (Result, error) {
 		if err := os.WriteFile(dst, []byte(f.Content), 0o644); err != nil {
 			return Result{}, err
 		}
+	}
+	if step.Fail != "" {
+		return Result{}, fmt.Errorf("mock executor: scripted failure: %s", step.Fail)
 	}
 	return Result{Output: step.Output, NumTurns: 1, DurationMS: 1}, nil
 }

@@ -11,6 +11,7 @@ import (
 	"orchestrator/internal/domain"
 	"orchestrator/internal/gitws"
 	"orchestrator/internal/proof"
+	"orchestrator/internal/sandbox"
 	"orchestrator/internal/verify"
 )
 
@@ -28,6 +29,48 @@ type TaskSpec struct {
 	Kind         domain.TaskKind // empty → inferred from the goal
 	HeadRef      string          // verify-only mode: existing change to verify
 	PR           *domain.PullRequestRef
+	// IdempotencyKey makes creation replay-safe: the same key returns the
+	// task created the first time (Existing=true) without a second run.
+	IdempotencyKey string
+	// WorkspaceID is the authorization scope; when a repository registry is
+	// used, every repo must belong to this workspace (or be unscoped).
+	WorkspaceID string
+	forcedID    string
+}
+
+// CreateTaskIdempotent is CreateTaskSpec with duplicate suppression. The
+// second return value reports whether an existing task was returned.
+func (e *Engine) CreateTaskIdempotent(spec TaskSpec) (*domain.Task, bool, error) {
+	if spec.IdempotencyKey == "" {
+		t, err := e.CreateTaskSpec(spec)
+		return t, false, err
+	}
+	// Reserve the key with a provisional ID first so two concurrent creators
+	// cannot both create; the loser returns the winner's task.
+	id := domain.NewID("task")
+	owner, dup, err := e.Store.ClaimIdempotencyKey(spec.IdempotencyKey, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if dup {
+		// The winner reserved the key before creating the task; give it a
+		// moment to finish. A reservation without a task after that is a
+		// crashed creator: surface it, never create a second task.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			t, err := e.Store.GetTask(owner)
+			if err == nil {
+				return t, true, nil
+			}
+			if time.Now().After(deadline) {
+				return nil, true, fmt.Errorf("idempotency key %q is reserved by task %s which was never created (creator crashed?)", spec.IdempotencyKey, owner)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	spec.forcedID = id
+	t, err := e.CreateTaskSpec(spec)
+	return t, false, err
 }
 
 var bugfixWords = regexp.MustCompile(`(?i)\b(fix|bug|regress|broken|crash|incorrect|wrong|duplicate|fails?|leak|race)\b`)
@@ -47,11 +90,30 @@ func (e *Engine) CreateTaskSpec(spec TaskSpec) (*domain.Task, error) {
 	default:
 		return nil, fmt.Errorf("unknown task kind %q (bugfix|change)", spec.Kind)
 	}
-	t, err := e.CreateTask(spec.Goal, spec.Context, spec.Repos, spec.TestCommand)
+	if e.Repos != nil && spec.WorkspaceID != "" {
+		for _, ref := range spec.Repos {
+			if strings.HasPrefix(ref, "repo_") {
+				rp, err := e.Repos.Get(ref)
+				if err != nil {
+					return nil, err
+				}
+				if rp.Workspace != "" && rp.Workspace != spec.WorkspaceID {
+					return nil, fmt.Errorf("repository %s belongs to another workspace", ref)
+				}
+			}
+		}
+	}
+	t, err := e.createTask(spec.Goal, spec.Context, spec.Repos, spec.TestCommand, spec.forcedID)
 	if err != nil {
 		return nil, err
 	}
+	t.WorkspaceID = spec.WorkspaceID
 	t.ReproCommand = strings.TrimSpace(spec.ReproCommand)
+	if t.ReproCommand != "" {
+		if _, err := e.Policy.ValidateCommand(t.ReproCommand); err != nil {
+			return nil, fmt.Errorf("repro command: %w", err)
+		}
+	}
 	t.HeadRef = strings.TrimSpace(spec.HeadRef)
 	t.PR = spec.PR
 	t.Kind = spec.Kind
@@ -72,6 +134,20 @@ func (e *Engine) addArtifact(t *domain.Task, a domain.Artifact) domain.Artifact 
 	a.Phase = t.Status
 	a.At = time.Now().UTC()
 	a.WorktreeRoot = t.State.WorktreeRoot
+	a.ExecMode = string(e.Policy.Mode)
+	// Persist nothing unbounded or secret-bearing.
+	cap := e.Policy.MaxArtifact
+	if cap == 0 {
+		cap = 512 * 1024
+	}
+	for _, f := range []*string{&a.Output, &a.Diff, &a.Summary, &a.Counterexample} {
+		if len(*f) > cap {
+			*f = (*f)[:cap] + "\n…[artifact truncated by policy]…"
+			a.Truncated = true
+		}
+		red, n := sandbox.Redact(*f)
+		*f, a.Redacted = red, a.Redacted+n
+	}
 	if a.Producer == "" {
 		a.Producer = "engine." + string(t.Status)
 	}
@@ -98,6 +174,7 @@ func runArtifact(kind domain.ArtifactKind, title string, res domain.TestResult, 
 		Kind: kind, Title: title, Repo: res.Repo, Command: res.Command, Effective: res.Effective,
 		ExitCode: res.ExitCode, Passed: boolp(res.Passed), Output: res.Output, Narrow: narrow,
 		TimedOut: res.TimedOut, Tests: res.Tests, TestsParsed: res.TestsParsed, Repeat: repeat,
+		Truncated: res.Truncated, Redacted: res.Redacted,
 	}
 }
 
@@ -132,6 +209,10 @@ func (e *Engine) runBaseline(ctx context.Context, t *domain.Task) error {
 	if t.State.BaselineDone {
 		return nil
 	}
+	heads, dirty, err := e.WS.Heads(ctx, t)
+	if err != nil {
+		return err
+	}
 	var results []domain.TestResult
 	ran := 0
 	for _, r := range t.Repos {
@@ -139,12 +220,14 @@ func (e *Engine) runBaseline(ctx context.Context, t *domain.Task) error {
 		for _, c := range verificationCommands(t, dir) {
 			ran++
 			e.emit(t.ID, domain.EvBaselineStarted, map[string]any{"repo": r.Name, "command": c.Cmd, "narrow": c.Narrow})
-			res := verify.Run(ctx, r.Name, dir, c.Cmd, e.Cfg.TestTimeout)
+			res := verify.Run(ctx, e.Policy, r.Name, dir, c.Cmd, e.Cfg.TestTimeout)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			results = append(results, res)
-			e.addArtifact(t, runArtifact(domain.ArtBaselineRun, "baseline: "+c.Cmd, res, c.Narrow, 0))
+			a := runArtifact(domain.ArtBaselineRun, "baseline: "+c.Cmd, res, c.Narrow, 0)
+			e.bindSource(ctx, t, &a, heads, dirty)
+			e.addArtifact(t, a)
 			if res.Passed {
 				e.emit(t.ID, domain.EvBaselinePassed, map[string]any{"repo": r.Name, "command": c.Cmd})
 			} else {
@@ -197,18 +280,28 @@ func (e *Engine) snapshotPacket(t *domain.Task) (*domain.Packet, error) {
 		}
 	}
 	fresh := proof.Build(in)
-	existing, err := e.Store.Packets(t.ID)
-	if err != nil {
-		return nil, err
-	}
-	p, isNew := proof.NextVersion(existing, fresh)
-	if isNew {
+	fresh.ExecMode = string(e.Policy.Mode)
+	var p domain.Packet
+	err = e.Store.WithPacketLock(t.ID, func() error {
+		existing, err := e.Store.Packets(t.ID)
+		if err != nil {
+			return err
+		}
+		var isNew bool
+		p, isNew = proof.NextVersion(existing, fresh)
+		if !isNew {
+			return nil
+		}
 		if err := e.Store.AddPacket(p); err != nil {
-			return nil, err
+			return err
 		}
 		e.emit(t.ID, domain.EvPacketBuilt, map[string]any{
 			"version": p.Version, "verdict": string(p.Verdict), "gaps": len(p.Gaps), "fingerprint": p.Fingerprint,
 		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return &p, nil
 }
@@ -292,12 +385,17 @@ func (e *Engine) PacketVersion(taskID string, version int) (*domain.Packet, erro
 	return nil, fmt.Errorf("packet version %d not found", version)
 }
 
-var ErrTaskRunning = errors.New("task is still running; a verdict needs a finished packet")
+var (
+	ErrTaskRunning   = errors.New("task is still running; a verdict needs a finished packet")
+	ErrPacketChanged = errors.New("the packet changed since it was viewed; re-read before deciding")
+)
 
-// RecordVerdict stores the human merge decision against the current packet
-// version. It is refused while the workflow is still executing, so a verdict
-// always refers to a packet whose content the human could actually see.
-func (e *Engine) RecordVerdict(taskID, decision, note, by string) (*domain.Verdict, error) {
+// RecordVerdict stores the human merge decision against the packet version
+// the human actually saw. expectedVersion > 0 must equal the current packet
+// version — if the evidence or the code changed in between, the decision is
+// refused rather than silently attached to a packet nobody reviewed. It is
+// also refused while the workflow is executing.
+func (e *Engine) RecordVerdict(taskID, decision, note, by string, expectedVersion int) (*domain.Verdict, error) {
 	switch decision {
 	case "accept", "request_changes", "reject":
 	default:
@@ -313,6 +411,9 @@ func (e *Engine) RecordVerdict(taskID, decision, note, by string) (*domain.Verdi
 	p, err := e.snapshotPacket(t)
 	if err != nil {
 		return nil, err
+	}
+	if expectedVersion > 0 && p.Version != expectedVersion {
+		return nil, fmt.Errorf("%w: viewed v%d, current v%d (%s)", ErrPacketChanged, expectedVersion, p.Version, p.Verdict)
 	}
 	v := domain.Verdict{
 		ID: domain.NewID("ver"), TaskID: taskID, PacketVersion: p.Version,
@@ -356,4 +457,26 @@ func (e *Engine) applyHead(ctx context.Context, t *domain.Task) error {
 		e.addEvidence(t, domain.EvidenceImplemented, "an existing change is under verification", "external", fmt.Sprintf("%d file(s) at %s", len(files), t.HeadRef))
 	}
 	return e.Store.SaveTask(t)
+}
+
+// bindSource stamps the artifact with the source state captured BEFORE the
+// command ran and re-checks it afterwards. If the worktree moved during the
+// run the artifact is marked dirty (never current) instead of being
+// mislabelled with whichever SHA happened to be there at the end.
+func (e *Engine) bindSource(ctx context.Context, t *domain.Task, a *domain.Artifact, before map[string]string, dirtyBefore bool) {
+	a.SourceSHAs, a.SourceDirty = before, dirtyBefore
+	after, dirtyAfter, err := e.WS.Heads(ctx, t)
+	if err != nil {
+		a.SourceDirty = true
+		return
+	}
+	if dirtyAfter {
+		a.SourceDirty = true
+	}
+	for k, v := range before {
+		if after[k] != v {
+			a.SourceDirty = true
+			e.emit(t.ID, domain.EvWarning, map[string]any{"warning": "source state changed while a command was running; artifact marked not current", "artifact": a.Title})
+		}
+	}
 }

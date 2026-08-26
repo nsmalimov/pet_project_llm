@@ -89,7 +89,7 @@ async function loadCase(id){
 function render(v){
   for(const k of ['artifacts','verdicts','runs','evidence','decisions','versions'])v[k]=v[k]||[];
   for(const k of ['claims','gaps','risks'])v.packet[k]=v.packet[k]||[];v.packet.change=v.packet.change||{files:[]};
-  const t=v.task,p=v.packet,arts=Object.fromEntries(v.artifacts.map(a=>[a.id,a]));const active=ACTIVE.has(t.status);
+  window.__pv=v.packet.version;const t=v.task,p=v.packet,arts=Object.fromEntries(v.artifacts.map(a=>[a.id,a]));const active=ACTIVE.has(t.status);
   const core=p.claims.filter(c=>c.core),coreOk=core.filter(c=>c.status==='supported').length;
   const bandCls=active?'s-running':'s-'+p.verdict;
   const verdictText=active?'RUNNING':p.verdict.toUpperCase()+(p.verdict==='supported'&&p.gaps.length?`<div style="font-size:13px;font-weight:700;letter-spacing:.06em;color:var(--warn)">${p.gaps.length} NOT VERIFIED</div>`:'');
@@ -186,7 +186,7 @@ async function loadEvents(id){const evs=await api('/tasks/'+id+'/events');const 
 
 function toggle(id){open[id]=!open[id];const el=document.getElementById('ev-'+id);if(el)el.classList.toggle('hidden',!open[id]);const m=location.pathname.match(/^\/cases\/([^/]+)/);if(m&&id.startsWith('c-'))loadCase(m[1])}
 function setTab(t){tab=t;route()}
-async function decide(id,decision){const note=$('#note').value;try{await api('/tasks/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,note,by:'ui'})});await loadCase(id)}catch(e){alert(e.message)}}
+async function decide(id,decision){const note=$('#note').value;try{await api('/tasks/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,note,by:'ui',packet_version:window.__pv||0})});await loadCase(id)}catch(e){alert(e.message)}}
 async function resolve(id,did,opt){const note=($('#dnote-'+did)||{}).value||'';try{await api('/tasks/'+id+'/decisions/'+did+'/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({option:opt,note})});await loadCase(id)}catch(e){alert(e.message)}}
 
 const _render=render;render=function(v){_render(v);if(tab==='events')loadEvents(v.task.id)};

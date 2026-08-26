@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,13 +17,16 @@ import (
 	"syscall"
 
 	"orchestrator/internal/api"
+	"orchestrator/internal/auth"
 	"orchestrator/internal/domain"
 	"orchestrator/internal/engine"
 	"orchestrator/internal/executor"
 	"orchestrator/internal/github"
 	"orchestrator/internal/gitws"
 	"orchestrator/internal/memory"
+	"orchestrator/internal/repos"
 	"orchestrator/internal/router"
+	"orchestrator/internal/sandbox"
 	"orchestrator/internal/store"
 )
 
@@ -57,6 +61,10 @@ func main() {
 		err = cmdGithubStatus(os.Args[2:])
 	case "decide":
 		err = cmdDecide(os.Args[2:])
+	case "repo":
+		err = cmdRepo(os.Args[2:])
+	case "auth":
+		err = cmdAuth(os.Args[2:])
 	case "memory":
 		err = cmdMemory(os.Args[2:])
 	case "-h", "--help", "help":
@@ -99,11 +107,21 @@ Usage:
                                    commit status + PR comment for the packet (never a fake green);
                                    --post needs GITHUB_TOKEN and --pr on the task
   orc decide  <task-id> --decision accept|request_changes|reject [--note "..."]
+  orc repo    add <path> | list       register a source repository (tasks may reference repo IDs;
+                                     SAFE_SANDBOX accepts IDs only)
+  orc auth    init --workspace <name> --user <name>       first owner; prints a token once
+  orc auth    add-user --workspace <ws-id> --user <name> --role owner|admin|member|reviewer|viewer
+  orc auth    revoke --workspace <ws-id> --user <user-id>
   orc memory  add --kind <preference|project_rule|correction> [--scope name] "<text>"
   orc memory  list
 
 Common flags:
   --data <dir>   data directory (default ./.orchestrator)
+
+Environment:
+  PROOFLINE_SANDBOX=SAFE_SANDBOX|LOCAL_UNSAFE   execution boundary (default LOCAL_UNSAFE, printed loudly)
+  PROOFLINE_REPOS_ROOT=<dir>[:<dir>]            only repositories under these roots may be used
+  GITHUB_TOKEN, PROOFLINE_GITHUB_WEBHOOK_SECRET, PROOFLINE_PUBLIC_URL, PROOFLINE_GITHUB_API   GitHub integration
 
 `)
 }
@@ -153,12 +171,36 @@ func buildApp(dataDir, execName, scriptPath string) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	pol, err := sandbox.Default(abs)
+	if err != nil {
+		return nil, err
+	}
+	if m := os.Getenv("PROOFLINE_SANDBOX"); m != "" {
+		pol, err = pol.WithMode(sandbox.Mode(m))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if roots := os.Getenv("PROOFLINE_REPOS_ROOT"); roots != "" {
+		for _, r := range strings.Split(roots, ":") {
+			c, err := sandbox.Canonical(r)
+			if err != nil {
+				return nil, fmt.Errorf("PROOFLINE_REPOS_ROOT: %w", err)
+			}
+			pol.ReposRoots = append(pol.ReposRoots, c)
+		}
+	}
+	if w := pol.Warning(); w != "" {
+		fmt.Fprintln(os.Stderr, "⚠ "+w+" (set PROOFLINE_SANDBOX=SAFE_SANDBOX and PROOFLINE_REPOS_ROOT=<dir> to enforce the boundary)")
+	}
 	mem, err := memory.NewFileStore(abs)
 	if err != nil {
 		return nil, err
 	}
+	claude := executor.NewClaudeCLI()
+	claude.Policy = &pol
 	execs := map[string]executor.Executor{
-		"claude": executor.NewClaudeCLI(),
+		"claude": claude,
 	}
 	if scriptPath != "" {
 		sc, err := executor.LoadScript(scriptPath)
@@ -179,6 +221,8 @@ func buildApp(dataDir, execName, scriptPath string) (*app, error) {
 	rt := router.Rules{Executor: execName, CheapModel: "sonnet", StrongModel: "opus"}
 	ws := gitws.NewManager(filepath.Join(abs, "worktrees"))
 	eng := engine.New(st, ws, execs, rt, mem, engine.DefaultConfig())
+	eng.SetPolicy(pol)
+	eng.Repos = repos.Open(abs, pol)
 	return &app{eng: eng, mem: mem}, nil
 }
 
@@ -286,7 +330,20 @@ func cmdServe(args []string) error {
 		return err
 	}
 	srv := api.New(a.eng)
-	fmt.Printf("orchestrator API on %s (data: %s)\n", *addr, *dataDir)
+	as, err := auth.Open(*dataDir)
+	if err != nil {
+		return err
+	}
+	srv.Auth = as
+	if !as.Configured() && !isLoopback(*addr) {
+		return fmt.Errorf("refusing to bind %s without authentication configured (run `orc auth init` or bind to 127.0.0.1)", *addr)
+	}
+	srv.WebhookSecret = os.Getenv("PROOFLINE_GITHUB_WEBHOOK_SECRET")
+	srv.PublicURL = strings.TrimRight(os.Getenv("PROOFLINE_PUBLIC_URL"), "/")
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		srv.GitHub = &github.Client{Token: tok, BaseURL: os.Getenv("PROOFLINE_GITHUB_API")}
+	}
+	fmt.Printf("orchestrator API on %s (data: %s, sandbox: %s, github: %v)\n", *addr, *dataDir, a.eng.Policy.Mode, srv.GitHub != nil)
 	return http.ListenAndServe(*addr, srv.Handler())
 }
 
@@ -568,6 +625,7 @@ func cmdDecide(args []string) error {
 	decision := fs.String("decision", "", "accept | request_changes | reject")
 	note := fs.String("note", "", "why")
 	by := fs.String("by", os.Getenv("USER"), "who decides")
+	pv := fs.Int("packet-version", 0, "packet version you reviewed (refused if it changed since)")
 	a, rest, err := openApp(fs, args)
 	if err != nil {
 		return err
@@ -575,7 +633,7 @@ func cmdDecide(args []string) error {
 	if len(rest) < 1 || *decision == "" {
 		return errors.New("usage: orc decide <task-id> --decision accept|request_changes|reject [--note ...]")
 	}
-	v, err := a.eng.RecordVerdict(rest[0], *decision, *note, *by)
+	v, err := a.eng.RecordVerdict(rest[0], *decision, *note, *by, *pv)
 	if err != nil {
 		return err
 	}
@@ -694,4 +752,125 @@ func cmdGithubStatus(args []string) error {
 	}
 	fmt.Println("posted")
 	return nil
+}
+
+func cmdRepo(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orc repo add <path> | orc repo list")
+	}
+	switch args[0] {
+	case "add":
+		fs := flag.NewFlagSet("repo add", flag.ExitOnError)
+		gh := fs.String("github", "", "owner/name this clone mirrors (enables webhook/PR import)")
+		a, rest, err := openApp(fs, reorderArgs(args[1:]))
+		if err != nil {
+			return err
+		}
+		if len(rest) < 1 {
+			return errors.New("usage: orc repo add <path>")
+		}
+		rp, err := a.eng.Repos.Add(rest[0], "")
+		if err != nil {
+			return err
+		}
+		if *gh != "" {
+			if err := a.eng.Repos.SetGitHub(rp.ID, *gh); err != nil {
+				return err
+			}
+		}
+		fmt.Printf("%s  %s  %s  %s\n", rp.ID, rp.Name, rp.Path, *gh)
+		return nil
+	case "list":
+		fs := flag.NewFlagSet("repo list", flag.ExitOnError)
+		a, _, err := openApp(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		list, err := a.eng.Repos.List()
+		if err != nil {
+			return err
+		}
+		for _, rp := range list {
+			fmt.Printf("%s  %s  %s\n", rp.ID, rp.Name, rp.Path)
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown repo subcommand %q", args[0])
+}
+
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func cmdAuth(args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: orc auth init|add-user|revoke ...")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("auth "+sub, flag.ExitOnError)
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	wsName := fs.String("workspace", "", "workspace name (init) or id (add-user/revoke)")
+	user := fs.String("user", "", "user name (init/add-user) or id (revoke)")
+	role := fs.String("role", "member", "role for add-user")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	as, err := auth.Open(*dataDir)
+	if err != nil {
+		return err
+	}
+	switch sub {
+	case "init":
+		if *wsName == "" || *user == "" {
+			return errors.New("--workspace and --user are required")
+		}
+		ws, err := as.CreateWorkspace(*wsName)
+		if err != nil {
+			return err
+		}
+		u, err := as.CreateUser(*user)
+		if err != nil {
+			return err
+		}
+		if err := as.SetMembership(u.ID, ws.ID, auth.RoleOwner); err != nil {
+			return err
+		}
+		tok, err := as.IssueToken(u.ID, "initial")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("workspace %s (%s)\nuser %s (%s) role owner\ntoken (shown once): %s\n", ws.ID, ws.Name, u.ID, u.Name, tok)
+		return nil
+	case "add-user":
+		if *wsName == "" || *user == "" {
+			return errors.New("--workspace <ws-id> and --user <name> are required")
+		}
+		u, err := as.CreateUser(*user)
+		if err != nil {
+			return err
+		}
+		if err := as.SetMembership(u.ID, *wsName, auth.Role(*role)); err != nil {
+			return err
+		}
+		tok, err := as.IssueToken(u.ID, "initial")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("user %s (%s) role %s in %s\ntoken (shown once): %s\n", u.ID, u.Name, *role, *wsName, tok)
+		return nil
+	case "revoke":
+		if *wsName == "" || *user == "" {
+			return errors.New("--workspace <ws-id> and --user <user-id> are required")
+		}
+		return as.RevokeMembership(*user, *wsName)
+	}
+	return fmt.Errorf("unknown auth subcommand %q", sub)
 }

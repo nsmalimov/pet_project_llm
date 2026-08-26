@@ -68,6 +68,27 @@ Known thin spots of the slice:
   nothing forces it to; `not_checked` is self-reported.
 - UI is one embedded HTML file polling the API; no SSE, no auth.
 
+## Foundation sprint (2026-08-26, later) — see FABLE_HANDOFF.md
+
+- **Execution boundary** `internal/sandbox`: argv-only commands with a
+  runner allowlist, constructed env, process-group kill, caps, redaction,
+  worktree scan (symlink escape / submodules / nested repos → BLOCKED),
+  hardened git; `SAFE_SANDBOX` (macOS sandbox-exec, verified: ~/.ssh & net
+  denied for commands, Read-tool EPERM for the Claude CLI) vs `LOCAL_UNSAFE`
+  (default, loud). Repo registry with IDs; SAFE refuses raw paths.
+- **State**: CAS `task.json` (Version), per-task lease, idempotent creation,
+  verdict pinned to the viewed packet version (409 on change), packet
+  version serialisation, effects ledger (at-most-once GitHub posts).
+- **Evidence**: explicit claim policies + scope in the packet, source state
+  captured before/after commands, completeness flags (truncated/redacted/
+  timed out). `EVIDENCE_INVARIANTS.md` I1–I13 mapped to tests.
+- **GitHub**: webhook HMAC + delivery idempotency, PR import as verify-only
+  case bound to base/head SHA, revocation → BLOCKED, fake GitHub server;
+  real GitHub NOT VERIFIED (no token).
+- **Auth**: workspaces/memberships/tokens, permission matrix, central
+  middleware, cross-tenant tests; local single-user mode only on loopback.
+- **Lifecycle**: crash/cancel/restart tests; unknown work is never done.
+
 ## What is fake / stub / thin
 
 - **The router is 40 lines of if-else.** Deliberate: the *interface* carries

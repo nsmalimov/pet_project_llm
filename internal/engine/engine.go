@@ -20,8 +20,10 @@ import (
 	"orchestrator/internal/executor"
 	"orchestrator/internal/gitws"
 	"orchestrator/internal/memory"
+	"orchestrator/internal/repos"
 	"orchestrator/internal/roles"
 	"orchestrator/internal/router"
+	"orchestrator/internal/sandbox"
 	"orchestrator/internal/store"
 )
 
@@ -56,6 +58,11 @@ type Engine struct {
 	Router router.Router
 	Mem    memory.Store
 	Cfg    Config
+	// Policy is the execution boundary every command runs through.
+	Policy sandbox.Policy
+	// Repos resolves repository IDs/paths; nil → paths are canonicalised
+	// under Policy only (tests).
+	Repos *repos.Registry
 
 	// OnEvent, if set, receives every appended event (used for live CLI
 	// output; a future UI would subscribe the same way).
@@ -68,7 +75,24 @@ type Engine struct {
 var ErrAlreadyRunning = errors.New("task is already running")
 
 func New(st store.Store, ws *gitws.Manager, execs map[string]executor.Executor, rt router.Router, mem memory.Store, cfg Config) *Engine {
-	return &Engine{Store: st, WS: ws, Execs: execs, Router: rt, Mem: mem, Cfg: cfg, running: map[string]bool{}}
+	e := &Engine{Store: st, WS: ws, Execs: execs, Router: rt, Mem: mem, Cfg: cfg, running: map[string]bool{}}
+	// Default boundary: LOCAL_UNSAFE rooted at the data dir (worktrees live
+	// under <data>/worktrees, so they are inside the workspace root).
+	if ws != nil {
+		if pol, err := sandbox.Default(filepath.Dir(ws.Root)); err == nil {
+			e.Policy = pol
+			ws.MaxWorktreeBytes = pol.MaxWorktree
+		}
+	}
+	return e
+}
+
+// SetPolicy installs an explicit policy (mode, roots, caps).
+func (e *Engine) SetPolicy(p sandbox.Policy) {
+	e.Policy = p
+	if e.WS != nil {
+		e.WS.MaxWorktreeBytes = p.MaxWorktree
+	}
 }
 
 func (e *Engine) emit(taskID, typ string, data map[string]any) {
@@ -86,17 +110,29 @@ func (e *Engine) emit(taskID, typ string, data map[string]any) {
 // CreateTask validates repos, persists a new pending task and emits
 // task.created. It does not start execution.
 func (e *Engine) CreateTask(goal string, contextSrcs []string, repoPaths []string, testCommand string) (*domain.Task, error) {
+	return e.createTask(goal, contextSrcs, repoPaths, testCommand, "")
+}
+
+func (e *Engine) createTask(goal string, contextSrcs []string, repoPaths []string, testCommand string, forcedID string) (*domain.Task, error) {
 	if strings.TrimSpace(goal) == "" {
 		return nil, errors.New("task goal is required")
 	}
 	if len(repoPaths) == 0 {
 		return nil, errors.New("at least one --repo is required")
 	}
+	for _, c := range []string{testCommand} {
+		if strings.TrimSpace(c) == "" {
+			continue
+		}
+		if _, err := e.Policy.ValidateCommand(c); err != nil {
+			return nil, fmt.Errorf("test command: %w", err)
+		}
+	}
 	var repos []domain.RepoRef
 	seen := map[string]int{}
 	seenPath := map[string]bool{}
 	for _, p := range repoPaths {
-		abs, err := filepath.Abs(p)
+		abs, err := e.resolveRepo(p)
 		if err != nil {
 			return nil, err
 		}
@@ -112,8 +148,12 @@ func (e *Engine) CreateTask(goal string, contextSrcs []string, repoPaths []strin
 		repos = append(repos, domain.RepoRef{Name: name, Path: abs})
 	}
 	now := time.Now().UTC()
+	id := forcedID
+	if id == "" {
+		id = domain.NewID("task")
+	}
 	t := &domain.Task{
-		ID:          domain.NewID("task"),
+		ID:          id,
 		Goal:        goal,
 		Context:     contextSrcs,
 		Repos:       repos,
@@ -129,6 +169,24 @@ func (e *Engine) CreateTask(goal string, contextSrcs []string, repoPaths []strin
 		"goal": goal, "repos": repoPaths, "context": contextSrcs,
 	})
 	return t, nil
+}
+
+// resolveRepo maps a repo ID or path to a canonical, policy-validated path.
+func (e *Engine) resolveRepo(ref string) (string, error) {
+	if e.Repos != nil {
+		return e.Repos.Resolve(ref)
+	}
+	if strings.HasPrefix(ref, "repo_") {
+		return "", fmt.Errorf("repository IDs need a registry; got %s", ref)
+	}
+	c, err := sandbox.Canonical(ref)
+	if err != nil {
+		return "", fmt.Errorf("repository path: %w", err)
+	}
+	if sandbox.Under(e.Policy.WorkspaceRoot, c) {
+		return "", fmt.Errorf("repository %s is inside the Proofline workspace; refusing", c)
+	}
+	return c, nil
 }
 
 // RunTask drives the task until it reaches a terminal state or pauses on a
@@ -199,6 +257,12 @@ func (e *Engine) RunTask(ctx context.Context, id string) error {
 				// Cancelled/deadline: leave status as-is; restart recovery
 				// will mark the task interrupted.
 				return stepErr
+			}
+			if errors.Is(stepErr, gitws.ErrHostileRepo) {
+				// Policy violations are not retried: the repository content
+				// itself is the problem. Block visibly.
+				e.emit(t.ID, domain.EvPolicyViolation, map[string]any{"error": stepErr.Error()})
+				return e.failTask(t, "BLOCKED by execution policy: "+stepErr.Error())
 			}
 			// A step failure (agent timeout, unparseable output, transient
 			// executor error) must not discard the task's accumulated work.

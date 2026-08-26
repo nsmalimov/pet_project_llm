@@ -5,7 +5,15 @@
 // SQLite later means implementing this interface, nothing else.
 package store
 
-import "orchestrator/internal/domain"
+import (
+	"errors"
+
+	"orchestrator/internal/domain"
+)
+
+// ErrConflict is returned by SaveTask when the snapshot changed underneath
+// the caller (optimistic concurrency).
+var ErrConflict = errors.New("task snapshot changed concurrently")
 
 type Store interface {
 	// LockTask takes an exclusive cross-process lock on the task (used by the
@@ -14,6 +22,8 @@ type Store interface {
 	LockTask(id string) (func(), error)
 
 	CreateTask(t *domain.Task) error
+	// SaveTask is compare-and-swap: it fails with ErrConflict unless the
+	// stored Version equals t.Version, then stores t with Version+1.
 	SaveTask(t *domain.Task) error
 	GetTask(id string) (*domain.Task, error)
 	ListTasks() ([]*domain.Task, error)
@@ -34,11 +44,22 @@ type Store interface {
 	Artifacts(taskID string) ([]domain.Artifact, error)
 
 	// Packets are append-only versions; Packets returns them in version order.
+	// WithPacketLock serialises "read versions → append new version" across
+	// goroutines and processes so version numbers are never duplicated.
+	WithPacketLock(taskID string, fn func() error) error
 	AddPacket(p domain.Packet) error
 	Packets(taskID string) ([]domain.Packet, error)
 
 	AddVerdict(v domain.Verdict) error
 	Verdicts(taskID string) ([]domain.Verdict, error)
+
+	// Idempotency: Claim returns (taskID, true) when key was already used.
+	// Otherwise it records key→taskID atomically and returns (taskID, false).
+	ClaimIdempotencyKey(key, taskID string) (string, bool, error)
+
+	// External effects ledger (append-only; last record per key wins).
+	AddEffect(e domain.ExternalEffect) error
+	Effects(taskID string) ([]domain.ExternalEffect, error)
 
 	CreateDecision(d *domain.Decision) error
 	SaveDecision(d *domain.Decision) error

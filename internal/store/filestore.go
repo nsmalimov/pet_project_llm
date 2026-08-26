@@ -34,7 +34,8 @@ type FileStore struct {
 
 type taskLock struct {
 	mu      sync.Mutex
-	lastSeq int64 // 0 = unknown, recomputed lazily from events.jsonl
+	pmu     sync.Mutex // packet version serialisation
+	lastSeq int64      // 0 = unknown, recomputed lazily from events.jsonl
 }
 
 func NewFileStore(root string) (*FileStore, error) {
@@ -151,15 +152,79 @@ func (s *FileStore) CreateTask(t *domain.Task) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
+	t.Version = 1
 	return writeJSON(filepath.Join(dir, "task.json"), t)
 }
 
+// SaveTask is compare-and-swap across goroutines (mutex) and processes
+// (blocking flock on <task>/.cas): read stored version, compare, write.
 func (s *FileStore) SaveTask(t *domain.Task) error {
 	l := s.lockFor(t.ID)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	unlock, err := s.fileLock(filepath.Join(s.taskDir(t.ID), ".cas"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	cur, err := s.GetTask(t.ID)
+	if err != nil {
+		return err
+	}
+	if cur.Version != t.Version {
+		return fmt.Errorf("%w: task %s stored v%d, caller has v%d", ErrConflict, t.ID, cur.Version, t.Version)
+	}
+	t.Version++
 	t.UpdatedAt = time.Now().UTC()
-	return writeJSON(filepath.Join(s.taskDir(t.ID), "task.json"), t)
+	if err := writeJSON(filepath.Join(s.taskDir(t.ID), "task.json"), t); err != nil {
+		t.Version-- // keep the caller's view consistent with disk
+		return err
+	}
+	return nil
+}
+
+// fileLock takes a blocking exclusive flock on path.
+func (s *FileStore) fileLock(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
+
+// ---------- idempotency & external effects ----------
+
+func (s *FileStore) ClaimIdempotencyKey(key, taskID string) (string, bool, error) {
+	path := filepath.Join(s.root, "idempotency.json")
+	unlock, err := s.fileLock(path + ".lock")
+	if err != nil {
+		return "", false, err
+	}
+	defer unlock()
+	m := map[string]string{}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &m)
+	}
+	if existing, ok := m[key]; ok {
+		return existing, true, nil
+	}
+	m[key] = taskID
+	return taskID, false, writeJSON(path, m)
+}
+
+func (s *FileStore) AddEffect(e domain.ExternalEffect) error {
+	return appendJSONL(filepath.Join(s.taskDir(e.TaskID), "effects.jsonl"), e)
+}
+
+func (s *FileStore) Effects(taskID string) ([]domain.ExternalEffect, error) {
+	return readJSONL[domain.ExternalEffect](filepath.Join(s.taskDir(taskID), "effects.jsonl"))
 }
 
 func (s *FileStore) GetTask(id string) (*domain.Task, error) {
@@ -284,6 +349,18 @@ func (s *FileStore) AddArtifact(a domain.Artifact) error {
 
 func (s *FileStore) Artifacts(taskID string) ([]domain.Artifact, error) {
 	return readJSONL[domain.Artifact](filepath.Join(s.taskDir(taskID), "artifacts.jsonl"))
+}
+
+func (s *FileStore) WithPacketLock(taskID string, fn func() error) error {
+	l := s.lockFor(taskID)
+	l.pmu.Lock()
+	defer l.pmu.Unlock()
+	unlock, err := s.fileLock(filepath.Join(s.taskDir(taskID), ".packets"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn()
 }
 
 func (s *FileStore) AddPacket(p domain.Packet) error {

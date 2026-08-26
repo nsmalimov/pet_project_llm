@@ -176,3 +176,24 @@ func TestBaselineOnWrongRevisionIsStale(t *testing.T) {
 		t.Fatalf("baseline not on base → %s", s)
 	}
 }
+
+func TestTruncatedOutputIsIncomplete(t *testing.T) {
+	task, arts := base()
+	arts[3].Truncated = true
+	p := build(task, arts)
+	if s := status(p, domain.ClaimChangeVerified); s != domain.ClaimInsufficient {
+		t.Fatalf("truncated run → %s", s)
+	}
+}
+
+func TestEveryClaimCarriesItsPolicy(t *testing.T) {
+	task, arts := base()
+	for _, c := range build(task, arts).Claims {
+		if c.Policy == "" {
+			t.Errorf("claim %s has no policy text", c.Type)
+		}
+		if c.Status == domain.ClaimSupported && c.Core && c.Scope == "" && c.Type != domain.ClaimRootCauseSupported && c.Type != domain.ClaimIndependentChallenge {
+			t.Errorf("supported core claim %s has no scope", c.Type)
+		}
+	}
+}

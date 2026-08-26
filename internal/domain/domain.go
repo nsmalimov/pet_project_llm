@@ -78,6 +78,8 @@ type TestResult struct {
 	// individual test names can be verified). Empty = same as Command.
 	Effective string `json:"effective,omitempty"`
 	TimedOut  bool   `json:"timed_out,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"` // output was capped; per-test results discarded
+	Redacted  int    `json:"redacted,omitempty"`  // secret-like substrings masked
 	// Tests lists the individual test cases the runner reported, when the
 	// output format is known (go test -v, pytest -v). TestsParsed says the
 	// runner format was recognised (so an empty list means "no test ran").
@@ -140,6 +142,9 @@ type TaskState struct {
 	// Commits maps repo name -> SHA of the last engine-made commit of the
 	// developer's change in that worktree.
 	Commits map[string]string `json:"commits,omitempty"`
+	// PinnedBase, when set (PR import), is the commit worktrees are created
+	// from instead of the repository's HEAD.
+	PinnedBase string `json:"pinned_base,omitempty"`
 
 	// Notes accumulates human input: decision resolutions, extra guidance.
 	Notes []string `json:"notes,omitempty"`
@@ -155,10 +160,13 @@ type TaskState struct {
 
 // Task is a single engineering task moving through the workflow.
 type Task struct {
-	ID      string    `json:"id"`
-	Goal    string    `json:"goal"`
-	Context []string  `json:"context,omitempty"` // extra context sources (freeform)
-	Repos   []RepoRef `json:"repos"`
+	ID string `json:"id"`
+	// WorkspaceID is the authorization scope. Every task-scoped resource
+	// (packet, artifact, decision, run, verdict, effect) inherits it.
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	Goal        string    `json:"goal"`
+	Context     []string  `json:"context,omitempty"` // extra context sources (freeform)
+	Repos       []RepoRef `json:"repos"`
 	// TestCommand overrides auto-detected verification for all repos.
 	TestCommand string `json:"test_command,omitempty"`
 	// ReproCommand, if set, is the narrow command expected to FAIL before the
@@ -178,7 +186,25 @@ type Task struct {
 	FailureReason string          `json:"failure_reason,omitempty"`
 	CreatedAt     time.Time       `json:"created_at"`
 	UpdatedAt     time.Time       `json:"updated_at"`
-	State         TaskState       `json:"state"`
+	// Version is the optimistic-concurrency counter of the snapshot. Every
+	// SaveTask must present the version it read; a mismatch is a conflict.
+	Version int       `json:"version"`
+	State   TaskState `json:"state"`
+}
+
+// ExternalEffect records an intent to cause a side effect outside Proofline
+// (GitHub status, comment) so a crash between the effect and the local
+// commit is detectable: a pending intent on retry means "unknown whether it
+// happened", never "do it again".
+type ExternalEffect struct {
+	Key     string    `json:"key"` // idempotency key: kind|target|packet version
+	TaskID  string    `json:"task_id"`
+	Kind    string    `json:"kind"`   // github_status | github_comment
+	Target  string    `json:"target"` // owner/repo@sha or owner/repo#N
+	Status  string    `json:"status"` // pending | done | failed | unknown
+	Detail  string    `json:"detail,omitempty"`
+	At      time.Time `json:"at"`
+	Attempt int       `json:"attempt"`
 }
 
 // ---------- Events ----------
@@ -228,6 +254,7 @@ const (
 	EvPacketBuilt       = "packet.built"
 	EvVerdictRecorded   = "verdict.recorded"
 	EvHeadApplied       = "workspace.head_applied" // verify-only mode: worktree moved to the head ref
+	EvPolicyViolation   = "policy.violation"       // hostile repository content / escape attempt; task blocked
 )
 
 // ---------- Decisions ----------
@@ -361,6 +388,9 @@ type Artifact struct {
 	Narrow      bool       `json:"narrow,omitempty"`
 	Effective   string     `json:"effective_command,omitempty"`
 	TimedOut    bool       `json:"timed_out,omitempty"`
+	Truncated   bool       `json:"truncated,omitempty"` // Completeness: output capped
+	Redacted    int        `json:"redacted,omitempty"`  // secret-like substrings masked before persistence
+	ExecMode    string     `json:"exec_mode,omitempty"` // SAFE_SANDBOX | LOCAL_UNSAFE at production time
 	Tests       []TestCase `json:"tests,omitempty"`
 	TestsParsed bool       `json:"tests_parsed,omitempty"` // false = runner output not parseable
 	Repeat      int        `json:"repeat,omitempty"`       // 1-based index when the same command is run several times
@@ -422,6 +452,13 @@ type Claim struct {
 	Gap         string      `json:"gap,omitempty"`
 	ArtifactIDs []string    `json:"artifact_ids,omitempty"`
 	EvidenceIDs []string    `json:"evidence_ids,omitempty"`
+	// Policy states, in one sentence, what evidence this claim requires to
+	// be SUPPORTED. It is part of the packet so a reader can audit the rule,
+	// not just the outcome.
+	Policy string `json:"policy"`
+	// Scope states what the evidence covers (repo, command, tests) so a
+	// SUPPORTED claim cannot be read as broader than it is.
+	Scope string `json:"scope,omitempty"`
 }
 
 // Risk is an unresolved concern. Source tells the reader whether it comes
@@ -470,6 +507,8 @@ type Packet struct {
 	Gaps           []string `json:"gaps"`
 	Risks          []Risk   `json:"risks"`
 	Confidence     string   `json:"confidence"` // strongest evidence level (legacy chain)
+	// ExecMode states the execution boundary the evidence was produced under.
+	ExecMode string `json:"exec_mode,omitempty"`
 }
 
 // Verdict is the human merge decision on a packet version. It is recorded

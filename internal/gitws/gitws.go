@@ -8,6 +8,7 @@ package gitws
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,17 +16,68 @@ import (
 	"strings"
 
 	"orchestrator/internal/domain"
+	"orchestrator/internal/sandbox"
 )
 
 type Manager struct {
 	Root string // e.g. <data-dir>/worktrees
+	// MaxWorktreeBytes blocks trees larger than this (0 = unlimited).
+	MaxWorktreeBytes int64
 }
 
 func NewManager(root string) *Manager { return &Manager{Root: root} }
 
+var gitHomeDir string
+
+// gitHome is an empty HOME so no user-level git config/aliases/hooks apply.
+func gitHome() string {
+	if gitHomeDir == "" {
+		d := filepath.Join(os.TempDir(), "proofline-git-home")
+		_ = os.MkdirAll(d, 0o700)
+		gitHomeDir = d
+	}
+	return gitHomeDir
+}
+
+// Scan checks every worktree of the task for hostile content. Called after
+// checkout and before verification (an agent may have planted a symlink).
+func (m *Manager) Scan(t *domain.Task) ([]sandbox.Violation, error) {
+	var all []sandbox.Violation
+	for _, r := range t.Repos {
+		v, err := sandbox.ScanWorktree(filepath.Join(t.State.WorktreeRoot, r.Name), m.MaxWorktreeBytes)
+		if err != nil {
+			return nil, err
+		}
+		for i := range v {
+			v[i].Path = r.Name + "/" + strings.TrimPrefix(strings.TrimPrefix(v[i].Path, filepath.Join(t.State.WorktreeRoot, r.Name)), "/")
+		}
+		all = append(all, v...)
+	}
+	return all, nil
+}
+
+// ErrHostileRepo marks repository content that must block the task rather
+// than be retried: symlinks escaping the worktree, submodules, nested repos.
+var ErrHostileRepo = errors.New("repository content violates the execution policy")
+
+// gitHardening neutralises the ways a repository's own config can run code
+// on the host during ordinary git operations.
+var gitHardening = []string{
+	"-c", "core.hooksPath=/dev/null",
+	"-c", "core.fsmonitor=false",
+	"-c", "core.pager=cat",
+	"-c", "core.editor=true",
+	"-c", "protocol.file.allow=never",
+	"-c", "core.sshCommand=/usr/bin/false",
+	"-c", "credential.helper=",
+}
+
 func git(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", append(append([]string{}, gitHardening...), args...)...)
 	cmd.Dir = dir
+	// No host environment: no credential helpers, no GIT_* overrides, no
+	// global config (HOME points at an empty directory).
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + gitHome(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "LANG=C"}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -63,9 +115,13 @@ func (m *Manager) Prepare(ctx context.Context, t *domain.Task) error {
 			}
 			continue
 		}
-		sha, err := git(ctx, r.Path, "rev-parse", "HEAD")
+		baseRef := "HEAD"
+		if t.State.PinnedBase != "" {
+			baseRef = t.State.PinnedBase
+		}
+		sha, err := git(ctx, r.Path, "rev-parse", "--verify", baseRef+"^{commit}")
 		if err != nil {
-			return fmt.Errorf("repo %s has no commits or is not a git repo: %w", r.Path, err)
+			return fmt.Errorf("repo %s: base %s not found: %w", r.Path, baseRef, err)
 		}
 		sha = strings.TrimSpace(sha)
 		// Persist the base SHA before creating the worktree so a crash in
@@ -73,7 +129,7 @@ func (m *Manager) Prepare(ctx context.Context, t *domain.Task) error {
 		if err := os.WriteFile(baseFile, []byte(sha+"\n"), 0o644); err != nil {
 			return err
 		}
-		if _, err := git(ctx, r.Path, "worktree", "add", "-b", branch, dst, "HEAD"); err != nil {
+		if _, err := git(ctx, r.Path, "worktree", "add", "-b", branch, dst, sha); err != nil {
 			// Branch may survive from a previous attempt; reuse it.
 			if _, err2 := git(ctx, r.Path, "worktree", "add", dst, branch); err2 != nil {
 				return err
@@ -83,7 +139,23 @@ func (m *Manager) Prepare(ctx context.Context, t *domain.Task) error {
 	}
 	t.State.WorktreeRoot = root
 	t.State.Branch = branch
+	if v, err := m.Scan(t); err != nil {
+		return err
+	} else if len(v) > 0 {
+		return fmt.Errorf("%w: %s", ErrHostileRepo, describe(v))
+	}
 	return nil
+}
+
+func describe(v []sandbox.Violation) string {
+	parts := make([]string, 0, len(v))
+	for _, x := range v {
+		parts = append(parts, x.Path+": "+x.Reason)
+	}
+	if len(parts) > 5 {
+		parts = append(parts[:5], fmt.Sprintf("+%d more", len(parts)-5))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // Diff returns the combined diff (committed + uncommitted, including new
@@ -101,11 +173,11 @@ func (m *Manager) Diff(ctx context.Context, t *domain.Task) (diff string, files 
 		if _, err := git(ctx, dir, "add", "-A", "-N"); err != nil {
 			return "", nil, err
 		}
-		d, err := git(ctx, dir, "diff", base)
+		d, err := git(ctx, dir, "diff", "--no-ext-diff", "--no-textconv", base)
 		if err != nil {
 			return "", nil, err
 		}
-		names, err := git(ctx, dir, "diff", "--name-only", base)
+		names, err := git(ctx, dir, "diff", "--no-ext-diff", "--name-only", base)
 		if err != nil {
 			return "", nil, err
 		}
@@ -156,6 +228,24 @@ func (m *Manager) Commit(ctx context.Context, t *domain.Task, message string) (m
 	return out, nil
 }
 
+// Fetch brings ref (a SHA or branch) from the repository's origin into the
+// local object store so a PR head can be verified. Runs with the hardened
+// git environment (no credential helpers, no hooks); a remote that needs
+// credentials must be configured on the repository itself.
+func (m *Manager) Fetch(ctx context.Context, repoPath, ref string) error {
+	args := []string{"-c", "protocol.file.allow=always", "fetch", "--no-tags", "--no-recurse-submodules", "origin", ref}
+	if _, err := git(ctx, repoPath, args...); err != nil {
+		return fmt.Errorf("fetch %s: %w", ref, err)
+	}
+	return nil
+}
+
+// HasCommit reports whether sha exists in the repository.
+func (m *Manager) HasCommit(ctx context.Context, repoPath, sha string) bool {
+	_, err := git(ctx, repoPath, "cat-file", "-e", sha+"^{commit}")
+	return err == nil
+}
+
 // ApplyHead moves every worktree branch to ref (resolved in the shared
 // object store of the original repository). Used by verify-only tasks: the
 // baseline ran on the base, now the existing change under review is checked
@@ -173,6 +263,11 @@ func (m *Manager) ApplyHead(ctx context.Context, t *domain.Task, ref string) (ma
 			return nil, err
 		}
 		out[r.Name] = sha
+	}
+	if v, err := m.Scan(t); err != nil {
+		return nil, err
+	} else if len(v) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrHostileRepo, describe(v))
 	}
 	return out, nil
 }

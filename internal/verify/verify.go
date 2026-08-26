@@ -4,16 +4,15 @@
 package verify
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"orchestrator/internal/domain"
+	"orchestrator/internal/sandbox"
 )
 
 // DetectCommand returns the test command for a repo directory, or "" if none
@@ -49,44 +48,38 @@ func DetectCommand(dir string) string {
 	return ""
 }
 
-// MaxOutput caps the full output kept in artifacts.
-const MaxOutput = 256 * 1024
-
-// Run executes command (via sh -c) in dir and returns a TestResult.
-func Run(ctx context.Context, repoName, dir, command string, timeout time.Duration) domain.TestResult {
-	if timeout == 0 {
-		timeout = 10 * time.Minute
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
+// Run executes command in dir through the sandbox policy (argv, no shell,
+// constructed env, process-group kill, output cap, redaction) and returns a
+// TestResult. A command the policy rejects is a failed run with exit -1 and
+// the reason in the output — never a pass.
+func Run(ctx context.Context, pol sandbox.Policy, repoName, dir, command string, timeout time.Duration) domain.TestResult {
 	effective := Verbose(command)
-	cmd := exec.CommandContext(ctx, "sh", "-c", effective)
-	cmd.Dir = dir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-
-	res := domain.TestResult{Repo: repoName, Command: command, Passed: err == nil}
+	res := domain.TestResult{Repo: repoName, Command: command}
 	if effective != command {
 		res.Effective = effective
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		res.ExitCode = exitErr.ExitCode()
-	} else if err != nil {
+	argv, err := pol.ValidateCommand(effective)
+	if err != nil {
 		res.ExitCode = -1
-		out.WriteString("\nrunner error: " + err.Error())
+		res.Output = "command rejected: " + err.Error()
+		res.OutputTail = res.Output
+		return res
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		res.TimedOut = true
-		res.Passed = false
-		out.WriteString("\nrunner: timed out after " + timeout.String())
-	}
-	res.OutputTail = tail(out.String(), 4000)
-	res.Output = tail(out.String(), MaxOutput)
-	res.Tests = ParseTests(effective, out.String())
+	r := pol.Run(ctx, sandbox.Spec{Dir: dir, Argv: argv, Timeout: timeout})
+	res.Passed = r.ExitCode == 0 && r.Err == nil && !r.TimedOut && !r.Killed
+	res.ExitCode = r.ExitCode
+	res.TimedOut = r.TimedOut
+	res.Truncated = r.Truncated
+	res.Redacted = r.Redacted
+	res.Output = r.Output
+	res.OutputTail = tail(r.Output, 4000)
+	res.Tests = ParseTests(effective, r.Output)
 	res.TestsParsed = res.Tests != nil
+	if r.Truncated && res.TestsParsed {
+		// Parsed results from a truncated stream are incomplete; say so.
+		res.Tests = nil
+		res.TestsParsed = false
+	}
 	return res
 }
 

@@ -2,8 +2,12 @@ package verify
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"orchestrator/internal/sandbox"
 )
 
 func TestVerboseInjection(t *testing.T) {
@@ -46,8 +50,20 @@ func TestParsePytest(t *testing.T) {
 }
 
 func TestTimeoutIsNotAPass(t *testing.T) {
-	res := Run(context.Background(), "r", t.TempDir(), "sleep 5", 200*time.Millisecond)
+	pol, err := sandbox.Default(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(pol.WorkspaceRoot, "wt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "Makefile"), []byte("test:\n\tsleep 5\n"), 0o644)
+	res := Run(context.Background(), pol, "r", dir, "make test", 200*time.Millisecond)
 	if res.Passed || !res.TimedOut {
 		t.Fatalf("%+v", res)
+	}
+	// A command the policy rejects is a failed run, never a pass.
+	res = Run(context.Background(), pol, "r", dir, "sh -c 'exit 0'", time.Second)
+	if res.Passed || res.ExitCode != -1 {
+		t.Fatalf("rejected command looked like a pass: %+v", res)
 	}
 }

@@ -156,7 +156,7 @@ func TestProoflineVerticalSlice(t *testing.T) {
 	}
 
 	// Human decision persists and pins the packet version.
-	if _, err := e.RecordVerdict(task.ID, "request_changes", "handler path unverified", "tester"); err != nil {
+	if _, err := e.RecordVerdict(task.ID, "request_changes", "handler path unverified", "tester", 0); err != nil {
 		t.Fatal(err)
 	}
 	// Re-open the store from disk: everything must survive a "refresh".
@@ -216,7 +216,7 @@ func TestPacketRefusesReproductionWhenBaselinePasses(t *testing.T) {
 	if v.Packet.Verdict != domain.ClaimBlocked {
 		t.Fatalf("verdict=%s, want blocked: %s", v.Packet.Verdict, v.Packet.VerdictWhy)
 	}
-	if _, err := e.RecordVerdict(task.ID, "merge", "", ""); err == nil {
+	if _, err := e.RecordVerdict(task.ID, "merge", "", "", 0); err == nil {
 		t.Fatal("invalid decision accepted")
 	}
 }
