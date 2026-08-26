@@ -89,6 +89,12 @@ Known thin spots of the slice:
   middleware, cross-tenant tests; local single-user mode only on loopback.
 - **Lifecycle**: crash/cancel/restart tests; unknown work is never done.
 
+## Private-beta step (2026-08-26, evening)
+Repository policy + real HTTP integration check (fixture server; baseline
+fails → after passes → SUPPORTED), re-verify, audit log, token UI, GitHub
+post from the packet, `make verify`, `Dockerfile` (build not verified —
+no Docker daemon), `orc gc`. Readiness table: PRIVATE_BETA_READINESS.md.
+
 ## What is fake / stub / thin
 
 - **The router is 40 lines of if-else.** Deliberate: the *interface* carries

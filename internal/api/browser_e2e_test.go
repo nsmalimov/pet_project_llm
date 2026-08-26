@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -84,6 +85,22 @@ func TestBrowserDecisionScreen(t *testing.T) {
 		if !strings.Contains(dom, want) {
 			t.Errorf("timeline lacks %q", want)
 		}
+	}
+	// Record a human decision (what the Accept/Request-changes buttons post),
+	// then reload the page: the decision must be visible and pinned.
+	var pv map[string]any
+	getJSON(t, srv.URL+"/tasks/"+task.ID+"/packet", &pv)
+	ver := int(pv["packet"].(map[string]any)["version"].(float64))
+	if code := postJSON(t, srv.URL+"/tasks/"+task.ID+"/verdict", fmt.Sprintf(`{"decision":"request_changes","note":"fake fix — reject the rewritten test","by":"ui","packet_version":%d}`, ver), nil); code != 201 {
+		t.Fatalf("verdict → %d", code)
+	}
+	dom = dumpDOM(t, chrome, srv.URL+"/cases/"+task.ID+"/packet")
+	if !strings.Contains(dom, "request changes") || !strings.Contains(dom, "fake fix — reject the rewritten test") || !strings.Contains(dom, fmt.Sprintf("on packet v%d", ver)) {
+		t.Error("recorded decision not visible after reload")
+	}
+	dom = dumpDOM(t, chrome, srv.URL+"/cases/"+task.ID+"/history")
+	if !strings.Contains(dom, "Packet versions") || !strings.Contains(dom, "request_changes") {
+		t.Error("history does not show the pinned decision")
 	}
 	// Overview lists the real case with its verdict; no hardcoded counts.
 	dom = dumpDOM(t, chrome, srv.URL+"/")

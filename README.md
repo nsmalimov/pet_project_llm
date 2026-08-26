@@ -8,6 +8,16 @@ events, agent runs and evidence — persisted on disk, resumable after restart.
 
 Written in Go, stdlib only. One binary, no external services.
 
+## Prerequisites
+
+- Go **1.23+** (`go.mod` pins `go 1.23`); git; `make`.
+- macOS for `SAFE_SANDBOX` (uses `/usr/bin/sandbox-exec`). Linux builds and
+  runs in `LOCAL_UNSAFE` only until a container boundary exists.
+- Optional: `claude` CLI (real agents), Google Chrome (browser e2e),
+  Docker (`make docker` builds the Linux image).
+
+`make verify` = build + vet + all tests + race subset + product acceptance.
+
 ## Open the app (Local Pilot)
 
 ```bash

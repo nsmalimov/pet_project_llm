@@ -1,11 +1,22 @@
-.PHONY: build run test race e2e
+.PHONY: build run test race e2e verify docker
+GO ?= go
 build:
-	go build -o bin/orc ./cmd/orc
+	$(GO) build -o bin/orc ./cmd/orc
 run: build
 	./bin/orc serve --addr 127.0.0.1:8080 --data ./.orchestrator
 test:
-	go vet ./... && go test ./...
+	$(GO) vet ./... && $(GO) test ./...
 race:
-	go test -race ./...
+	$(GO) test -race ./...
 e2e: build
-	go test ./internal/api/ -run 'TestBrowser|TestExampleCase' -v
+	$(GO) test ./internal/api/ -run 'TestBrowser|TestExampleCase|TestCancelOverHTTP' -v
+# verify = the full contract: build, vet, unit/integration tests, race tests,
+# product acceptance (HTTP + browser when Chrome is present).
+verify: build
+	$(GO) vet ./...
+	$(GO) test ./...
+	$(GO) test -race ./internal/store/ ./internal/proof/ ./internal/sandbox/ ./internal/engine/ -run 'TestSaveTaskIs|TestConcurrent|TestTwoWorkers|TestIdempotent|TestResolveDecisionTwice|TestFlaky|TestCommandInjection|TestBackground'
+	$(GO) test ./internal/api/ -run 'TestBrowser|TestExampleCase|TestCancelOverHTTP|TestCrossTenant|TestRoleMatrix'
+	@echo "verify: OK"
+docker:
+	docker build -t proofline:dev .

@@ -202,6 +202,21 @@ func (s *FileStore) fileLock(path string) (func(), error) {
 
 // ---------- idempotency & external effects ----------
 
+func (s *FileStore) AddAudit(a domain.AuditRecord) error {
+	return appendJSONL(filepath.Join(s.root, "audit.jsonl"), a)
+}
+
+func (s *FileStore) Audit(limit int) ([]domain.AuditRecord, error) {
+	all, err := readJSONL[domain.AuditRecord](filepath.Join(s.root, "audit.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(all) > limit {
+		all = all[len(all)-limit:]
+	}
+	return all, nil
+}
+
 func (s *FileStore) ClaimIdempotencyKey(key, taskID string) (string, bool, error) {
 	path := filepath.Join(s.root, "idempotency.json")
 	unlock, err := s.fileLock(path + ".lock")

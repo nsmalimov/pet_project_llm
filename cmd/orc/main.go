@@ -11,10 +11,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"orchestrator/examples"
 	"orchestrator/internal/api"
@@ -66,6 +68,8 @@ func main() {
 		err = cmdRepo(os.Args[2:])
 	case "auth":
 		err = cmdAuth(os.Args[2:])
+	case "gc":
+		err = cmdGC(os.Args[2:])
 	case "memory":
 		err = cmdMemory(os.Args[2:])
 	case "-h", "--help", "help":
@@ -108,11 +112,13 @@ Usage:
                                    commit status + PR comment for the packet (never a fake green);
                                    --post needs GITHUB_TOKEN and --pr on the task
   orc decide  <task-id> --decision accept|request_changes|reject [--note "..."]
-  orc repo    add <path> | list       register a source repository (tasks may reference repo IDs;
-                                     SAFE_SANDBOX accepts IDs only)
+  orc repo    add <path> [--github owner/name] | list | policy <id> --file policy.json
+                                     register a source repository and its verification policy
+                                     (approved test/repro commands, HTTP integration check)
   orc auth    init --workspace <name> --user <name>       first owner; prints a token once
   orc auth    add-user --workspace <ws-id> --user <name> --role owner|admin|member|reviewer|viewer
   orc auth    revoke --workspace <ws-id> --user <user-id>
+  orc gc      [--older 7d] [--dry-run]   remove worktrees of finished/failed cases (evidence stays)
   orc memory  add --kind <preference|project_rule|correction> [--scope name] "<text>"
   orc memory  list
 
@@ -787,6 +793,29 @@ func cmdRepo(args []string) error {
 		}
 		fmt.Printf("%s  %s  %s  %s\n", rp.ID, rp.Name, rp.Path, *gh)
 		return nil
+	case "policy":
+		fs := flag.NewFlagSet("repo policy", flag.ExitOnError)
+		file := fs.String("file", "", "JSON policy file {test_command, repro_command, integration{start,port,checks[]}}")
+		a, rest, err := openApp(fs, reorderArgs(args[1:]))
+		if err != nil {
+			return err
+		}
+		if len(rest) < 1 || *file == "" {
+			return errors.New("usage: orc repo policy <repo-id> --file policy.json")
+		}
+		b, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		var pol repos.Policy
+		if err := json.Unmarshal(b, &pol); err != nil {
+			return err
+		}
+		if err := a.eng.Repos.SetPolicy(rest[0], &pol); err != nil {
+			return err
+		}
+		fmt.Println("policy set for", rest[0])
+		return nil
 	case "list":
 		fs := flag.NewFlagSet("repo list", flag.ExitOnError)
 		a, _, err := openApp(fs, args[1:])
@@ -880,4 +909,42 @@ func cmdAuth(args []string) error {
 		return as.RevokeMembership(*user, *wsName)
 	}
 	return fmt.Errorf("unknown auth subcommand %q", sub)
+}
+
+// cmdGC removes worktrees (and their git branches) of terminal tasks older
+// than --older. Artifacts, events and packets are never touched: the proof
+// stays inspectable; only the checkout is reclaimed.
+func cmdGC(args []string) error {
+	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+	older := fs.Duration("older", 7*24*time.Hour, "only tasks updated longer ago than this")
+	dry := fs.Bool("dry-run", false, "print what would be removed")
+	a, _, err := openApp(fs, reorderArgs(args, "dry-run"))
+	if err != nil {
+		return err
+	}
+	tasks, err := a.eng.Store.ListTasks()
+	if err != nil {
+		return err
+	}
+	n := 0
+	for _, t := range tasks {
+		if !t.Status.Terminal() || t.State.WorktreeRoot == "" || time.Since(t.UpdatedAt) < *older {
+			continue
+		}
+		if _, err := os.Stat(t.State.WorktreeRoot); err != nil {
+			continue
+		}
+		fmt.Printf("%s %s worktree %s\n", map[bool]string{true: "would remove", false: "removing"}[*dry], t.ID, t.State.WorktreeRoot)
+		if *dry {
+			continue
+		}
+		for _, r := range t.Repos {
+			_ = exec.Command("git", "-C", r.Path, "worktree", "remove", "--force", filepath.Join(t.State.WorktreeRoot, r.Name)).Run()
+			_ = exec.Command("git", "-C", r.Path, "branch", "-D", t.State.Branch).Run()
+		}
+		_ = os.RemoveAll(t.State.WorktreeRoot)
+		n++
+	}
+	fmt.Printf("%d worktree(s) reclaimed\n", n)
+	return nil
 }

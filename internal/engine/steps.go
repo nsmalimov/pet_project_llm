@@ -317,6 +317,21 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 		t.State.LastTests = results
 	}
 
+	// Integration check (when the repository policy configures one): the
+	// service is started from the changed worktree and probed. A failing
+	// check is fed back to the developer like a failing test.
+	if allPassed(results) {
+		arts, err := e.runIntegration(ctx, t, "integration after change")
+		if err != nil {
+			return err
+		}
+		for _, a := range arts {
+			if a.Passed == nil || !*a.Passed {
+				results = append(results, domain.TestResult{Repo: a.Repo, Command: "INTEGRATION: " + a.Command, Passed: false, ExitCode: a.ExitCode, OutputTail: tailStr(a.Output, 4000)})
+			}
+		}
+		t.State.LastTests = results
+	}
 	if ran == 0 {
 		e.emit(t.ID, domain.EvTestsSkipped, map[string]any{
 			"reason": "no test command detected in any repo",

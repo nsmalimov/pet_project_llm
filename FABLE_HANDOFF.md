@@ -35,6 +35,14 @@ production-ready; see §9.
   CLI login — narrow when the CLI supports a file token); `TaskState`
   duplicates artifact facts; `Confidence` legacy chain still in the API.
 
+## 0b. Private-beta step (see PRIVATE_BETA_READINESS.md)
+Repository policy (`repos.Policy`: approved test/repro commands, HTTP
+integration check), the first real integration provider
+(`internal/integration`: service started from the worktree under the
+sandbox with localhost-only network, HTTP checks, artifact bound to SHA;
+claim core when configured), re-verify, audit log, token sign-in UI, GitHub
+post button, `make verify`, `Dockerfile` (unverified), `orc gc`.
+
 ## 1. Architecture now
 
 Single Go binary `orc`, stdlib only, modular monolith:

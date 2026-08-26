@@ -45,6 +45,10 @@ type Input struct {
 	// FileExists lets the builder check that a root-cause location really
 	// exists in the worktree; nil disables the check.
 	FileExists func(repoRelPath string) bool
+	// IntegrationConfigured says the repository policy defines an
+	// integration check; then the claim is core and a missing/failed run
+	// counts against the packet.
+	IntegrationConfigured bool
 }
 
 // RelativeInsideWorktree rejects agent-supplied paths that leave the worktree.
@@ -82,6 +86,9 @@ type builder struct {
 	tests     []domain.Artifact // test_run on the current state
 	staleRuns []domain.Artifact
 	replays   []domain.Artifact // original_tests_run on the current state
+	integ     []domain.Artifact // integration_run on the current state
+	integBase []domain.Artifact // integration_run on the base
+	integOld  []domain.Artifact // integration_run elsewhere (stale)
 	diff      *domain.Artifact  // last diff, any state
 	review    *domain.Artifact  // last review, any state
 	rootCause *domain.Artifact
@@ -99,7 +106,7 @@ func Build(in Input) domain.Packet {
 	b.change()
 	b.p.Claims = []domain.Claim{
 		b.claimReproduced(), b.claimRootCause(), b.claimChangeVerified(),
-		b.claimChallenge(), claimIntegration(), b.claimCrossService(),
+		b.claimChallenge(), b.claimIntegration(), b.claimCrossService(),
 	}
 	b.gapsAndRisks()
 	b.p.Verdict, b.p.VerdictWhy = b.verdict()
@@ -170,6 +177,15 @@ func (b *builder) index() {
 			if b.current(a) {
 				b.replays = append(b.replays, a)
 			}
+		case domain.ArtIntegrationRun:
+			switch {
+			case b.current(a):
+				b.integ = append(b.integ, a)
+			case b.onBase(a):
+				b.integBase = append(b.integBase, a)
+			default:
+				b.integOld = append(b.integOld, a)
+			}
 		case domain.ArtDiff:
 			b.diff = &b.in.Artifacts[i]
 		case domain.ArtReview:
@@ -203,7 +219,7 @@ const (
 	PolicyRootCause  = "SUPPORTED only as a cross-check: the researcher named a file that exists, the diff modifies that file, and the reproduction flipped fail→pass on the current state. Never a causal proof."
 	PolicyVerified   = "SUPPORTED only if the diff artifact and every test_run artifact are on the current source state (no dirty tree), all runs passed without timeout, repeated runs agree, at least one test executed, output was not truncated, every test that failed on the baseline was observed passing, and — if the author modified test files — the original tests replayed against the change also pass."
 	PolicyChallenge  = "SUPPORTED only if a review artifact on the current state has verdict=approve, no counterexample, no high-severity finding, a model different from the author's, and a non-empty list of checked aspects. Means 'no counterexample found', not 'correct'."
-	PolicyIntegrate  = "SUPPORTED only if an integration check artifact exists on the current state. No runner is configured in this build, so this claim is always INSUFFICIENT."
+	PolicyIntegrate  = "SUPPORTED only if the repository policy configures an integration check and an integration_run artifact on the current state shows every configured HTTP check passing against the service started from the worktree; a failing check is CONTRADICTED; not configured is INSUFFICIENT."
 	PolicyCross      = "SUPPORTED only if a cross-repository verification artifact exists. None can be produced in this build, so this claim is always INSUFFICIENT."
 )
 
@@ -664,14 +680,62 @@ func (b *builder) claimChallenge() domain.Claim {
 	return c
 }
 
-func claimIntegration() domain.Claim {
-	return domain.Claim{
-		Type: domain.ClaimIntegrationChecked, Title: "Integration checked", Core: false, Policy: PolicyIntegrate,
-		Status:    domain.ClaimInsufficient,
-		Statement: "No integration, log or trace check was executed.",
-		Reason:    "this deployment has no integration check runner configured",
-		Gap:       "not checked — behaviour behind HTTP/RPC boundaries, real datastores and logs is unverified",
+func (b *builder) claimIntegration() domain.Claim {
+	c := domain.Claim{Type: domain.ClaimIntegrationChecked, Title: "Integration checked", Core: b.in.IntegrationConfigured, Policy: PolicyIntegrate}
+	if !b.in.IntegrationConfigured {
+		c.Status = domain.ClaimInsufficient
+		c.Statement = "No integration check is configured for this repository."
+		c.Reason = "the repository policy has no integration check (start command + HTTP checks)"
+		c.Gap = "not checked — behaviour behind HTTP/RPC boundaries, real datastores and logs is unverified"
+		return c
 	}
+	if len(b.integ) == 0 {
+		if len(b.integOld) > 0 {
+			c.Status = domain.ClaimStale
+			c.Statement = "The integration check ran on an earlier revision of the change."
+			c.Reason = "no integration_run artifact on the current state"
+			c.ArtifactIDs = ids(b.integOld)
+		} else {
+			c.Status = domain.ClaimInsufficient
+			c.Statement = "The configured integration check has not run on the current code."
+			c.Reason = "no integration_run artifact on the current state"
+		}
+		c.Gap = "run the integration check on the current code"
+		return c
+	}
+	c.ArtifactIDs = ids(b.integ)
+	for _, a := range b.integ {
+		if a.Passed == nil || !*a.Passed {
+			c.Status = domain.ClaimContradicted
+			failed := testsWith(a.Tests, "fail")
+			if len(failed) > 0 {
+				c.Statement = "Integration check FAILED on the current code: " + joinMax(failed, 5) + "."
+			} else {
+				c.Statement = "The service could not be started or probed on the current code."
+			}
+			c.Reason = "integration_run artifact with failing checks on the current state"
+			c.Gap = "passing integration checks"
+			return c
+		}
+	}
+	names := []string{}
+	for _, a := range b.integ {
+		names = append(names, testsWith(a.Tests, "pass")...)
+	}
+	c.Status = domain.ClaimSupported
+	c.Statement = fmt.Sprintf("Service started from the worktree and %d HTTP check(s) passed: %s.", len(names), joinMax(names, 5))
+	c.Reason = "integration_run on the current state; every configured check passed"
+	if len(b.integBase) > 0 {
+		for _, a := range b.integBase {
+			if a.Passed != nil && !*a.Passed {
+				c.Reason += "; the same checks FAILED on the baseline (behaviour change observed end-to-end)"
+				c.ArtifactIDs = append(c.ArtifactIDs, a.ID)
+				break
+			}
+		}
+	}
+	c.Scope = "only the configured checks against the service started in isolation; no real datastore, no other services"
+	return c
 }
 
 func (b *builder) claimCrossService() domain.Claim {

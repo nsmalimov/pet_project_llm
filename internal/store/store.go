@@ -53,6 +53,10 @@ type Store interface {
 	AddVerdict(v domain.Verdict) error
 	Verdicts(taskID string) ([]domain.Verdict, error)
 
+	// Audit trail (append-only, instance-wide).
+	AddAudit(a domain.AuditRecord) error
+	Audit(limit int) ([]domain.AuditRecord, error)
+
 	// Idempotency: Claim returns (taskID, true) when key was already used.
 	// Otherwise it records key→taskID atomically and returns (taskID, false).
 	ClaimIdempotencyKey(key, taskID string) (string, bool, error)

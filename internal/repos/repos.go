@@ -26,6 +26,34 @@ type Repo struct {
 	AddedAt   time.Time `json:"added_at"`
 	Workspace string    `json:"workspace,omitempty"` // authorization scope
 	GitHub    string    `json:"github,omitempty"`    // owner/name this local clone mirrors
+	// Policy is the approved way to verify this repository. Public requests
+	// may not override it; SAFE mode requires it.
+	Policy *Policy `json:"policy,omitempty"`
+}
+
+// Policy is repository-level verification policy.
+type Policy struct {
+	TestCommand   string            `json:"test_command,omitempty"`
+	ReproCommand  string            `json:"repro_command,omitempty"`
+	Integration   *IntegrationCheck `json:"integration,omitempty"`
+	MaxWorktreeMB int               `json:"max_worktree_mb,omitempty"`
+}
+
+// IntegrationCheck starts the service from the worktree and probes it.
+type IntegrationCheck struct {
+	Start          string      `json:"start"`           // approved argv command, e.g. "go run ./cmd/server"
+	Port           int         `json:"port"`            // service listens on 127.0.0.1:port (PORT env is set)
+	StartupSeconds int         `json:"startup_seconds"` // wait for the port
+	Checks         []HTTPCheck `json:"checks"`
+}
+
+type HTTPCheck struct {
+	Name         string `json:"name"`
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+	Body         string `json:"body,omitempty"`
+	ExpectStatus int    `json:"expect_status"`
+	ExpectBody   string `json:"expect_body,omitempty"` // substring
 }
 
 type Registry struct {
@@ -103,6 +131,45 @@ func (r *Registry) SetGitHub(id, fullName string) error {
 	for i := range list {
 		if list[i].ID == id {
 			list[i].GitHub = strings.ToLower(fullName)
+			return r.save(list)
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrNotRegistered, id)
+}
+
+// SetPolicy replaces the repository policy after validating its commands.
+func (r *Registry) SetPolicy(id string, pol *Policy) error {
+	if pol != nil {
+		for _, c := range []string{pol.TestCommand, pol.ReproCommand} {
+			if c != "" {
+				if _, err := r.policy.ValidateCommand(c); err != nil {
+					return err
+				}
+			}
+		}
+		if pol.Integration != nil {
+			if _, err := r.policy.ValidateCommand(pol.Integration.Start); err != nil {
+				return fmt.Errorf("integration start: %w", err)
+			}
+			if pol.Integration.Port <= 0 || pol.Integration.Port > 65535 || len(pol.Integration.Checks) == 0 {
+				return errors.New("integration check needs a port and at least one check")
+			}
+			for _, c := range pol.Integration.Checks {
+				if c.Name == "" || !strings.HasPrefix(c.Path, "/") || c.ExpectStatus <= 0 {
+					return fmt.Errorf("integration check %q: name, path starting with / and expect_status are required", c.Name)
+				}
+			}
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	list, err := r.load()
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		if list[i].ID == id {
+			list[i].Policy = pol
 			return r.save(list)
 		}
 	}

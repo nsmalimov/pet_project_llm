@@ -27,6 +27,9 @@ type Spec struct {
 	ReadRoots []string
 	// Profile selects the OS sandbox flavour: "command" (default) or "agent".
 	Profile string
+	// LocalNetwork allows binding/accepting on localhost only (integration
+	// services under test). Outbound stays denied.
+	LocalNetwork bool
 }
 
 // Result is the outcome; Output is capped, Truncated says so.
@@ -271,6 +274,8 @@ func (p Policy) sbplProfile(dir string, spec Spec) (string, error) {
 		sb.WriteString("(allow network*)\n")
 	} else if spec.Network {
 		sb.WriteString("(allow network*)\n")
+	} else if spec.LocalNetwork {
+		sb.WriteString("(deny network*)\n(allow network-bind (local ip \"localhost:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n(allow network-outbound (remote ip \"localhost:*\"))\n")
 	} else {
 		sb.WriteString("(deny network*)\n")
 	}

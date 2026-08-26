@@ -1,0 +1,21 @@
+// Command server exposes the reservation store over HTTP on $PORT.
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+
+	"reservations"
+)
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8089"
+	}
+	http.Handle("/reserve", reservations.Handler{Store: reservations.NewStore()})
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	log.Printf("reservations listening on :%s", port)
+	log.Fatal(http.ListenAndServe("127.0.0.1:"+port, nil))
+}

@@ -4,9 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"orchestrator/fixtures"
 	"orchestrator/internal/domain"
 	"orchestrator/internal/executor"
 )
@@ -15,32 +15,10 @@ import (
 // bug) as a git repo named "reservations".
 func fixtureRepo(t *testing.T, root string) string {
 	t.Helper()
-	src := filepath.Join("..", "..", "fixtures", "reservations")
 	dir := filepath.Join(root, "reservations")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := fixtures.Materialize(dir); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".fixture") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(src, e.Name()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, strings.TrimSuffix(e.Name(), ".fixture")), b, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	gitRun(t, dir, "init", "-q")
-	gitRun(t, dir, "config", "user.email", "test@test")
-	gitRun(t, dir, "config", "user.name", "test")
-	gitRun(t, dir, "add", "-A")
-	gitRun(t, dir, "commit", "-q", "-m", "buggy")
 	return dir
 }
 

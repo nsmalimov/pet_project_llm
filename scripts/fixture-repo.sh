@@ -6,7 +6,7 @@ set -eu
 dest="${1:?usage: fixture-repo.sh <dest-dir>}"
 src="$(cd "$(dirname "$0")/../fixtures/reservations" && pwd)"
 mkdir -p "$dest"
-for f in "$src"/*.fixture; do cp "$f" "$dest/$(basename "$f" .fixture)"; done
+(cd "$src" && find . -name "*.fixture" | while read -r f; do mkdir -p "$dest/$(dirname "$f")"; cp "$f" "$dest/${f%.fixture}"; done)
 cd "$dest"
 git init -q
 git -c user.name=fixture -c user.email=fixture@localhost add -A

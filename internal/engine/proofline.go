@@ -10,7 +10,9 @@ import (
 
 	"orchestrator/internal/domain"
 	"orchestrator/internal/gitws"
+	"orchestrator/internal/integration"
 	"orchestrator/internal/proof"
+	"orchestrator/internal/repos"
 	"orchestrator/internal/sandbox"
 	"orchestrator/internal/verify"
 )
@@ -98,16 +100,33 @@ func (e *Engine) CreateTaskSpec(spec TaskSpec) (*domain.Task, error) {
 	default:
 		return nil, fmt.Errorf("unknown task kind %q (bugfix|change)", spec.Kind)
 	}
-	if e.Repos != nil && spec.WorkspaceID != "" {
+	if e.Repos != nil {
 		for _, ref := range spec.Repos {
-			if strings.HasPrefix(ref, "repo_") {
-				rp, err := e.Repos.Get(ref)
-				if err != nil {
-					return nil, err
+			if !strings.HasPrefix(ref, "repo_") {
+				continue
+			}
+			rp, err := e.Repos.Get(ref)
+			if err != nil {
+				return nil, err
+			}
+			if spec.WorkspaceID != "" && rp.Workspace != "" && rp.Workspace != spec.WorkspaceID {
+				return nil, fmt.Errorf("repository %s belongs to another workspace", ref)
+			}
+			// Repository policy decides how the repository is verified. A
+			// request may only omit the commands (policy fills them) or, in
+			// LOCAL_UNSAFE, override them visibly.
+			if rp.Policy != nil {
+				if spec.TestCommand == "" {
+					spec.TestCommand = rp.Policy.TestCommand
 				}
-				if rp.Workspace != "" && rp.Workspace != spec.WorkspaceID {
-					return nil, fmt.Errorf("repository %s belongs to another workspace", ref)
+				if spec.ReproCommand == "" {
+					spec.ReproCommand = rp.Policy.ReproCommand
 				}
+				if e.Policy.Mode == sandbox.ModeSafe && ((spec.TestCommand != "" && spec.TestCommand != rp.Policy.TestCommand) || (spec.ReproCommand != "" && spec.ReproCommand != rp.Policy.ReproCommand)) {
+					return nil, fmt.Errorf("SAFE_SANDBOX: commands must match the repository policy of %s", ref)
+				}
+			} else if e.Policy.Mode == sandbox.ModeSafe && (spec.TestCommand != "" || spec.ReproCommand != "") {
+				return nil, fmt.Errorf("SAFE_SANDBOX: repository %s has no policy; ad-hoc commands are refused", ref)
 			}
 		}
 	}
@@ -219,6 +238,74 @@ func verificationCommands(t *domain.Task, dir string) []verifyCmd {
 	return out
 }
 
+// repoPolicy returns the registered policy for a task repo, if any.
+func (e *Engine) repoPolicy(r domain.RepoRef) *repos.Policy {
+	if e.Repos == nil {
+		return nil
+	}
+	list, err := e.Repos.List()
+	if err != nil {
+		return nil
+	}
+	for _, rp := range list {
+		if rp.Path == r.Path {
+			return rp.Policy
+		}
+	}
+	return nil
+}
+
+// integrationConfigured reports whether any task repo has an integration check.
+func (e *Engine) integrationConfigured(t *domain.Task) bool {
+	for _, r := range t.Repos {
+		if p := e.repoPolicy(r); p != nil && p.Integration != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// runIntegration starts the service from each worktree with an integration
+// policy and probes it. Artifacts are bound to the source state captured
+// before the run. Returns the results (nil when nothing is configured).
+func (e *Engine) runIntegration(ctx context.Context, t *domain.Task, title string) ([]domain.Artifact, error) {
+	var out []domain.Artifact
+	for _, r := range t.Repos {
+		pol := e.repoPolicy(r)
+		if pol == nil || pol.Integration == nil {
+			continue
+		}
+		heads, dirty, err := e.WS.Heads(ctx, t)
+		if err != nil {
+			return out, err
+		}
+		dir := gitws.RepoDir(t, r)
+		e.emit(t.ID, domain.EvTestsStarted, map[string]any{"repo": r.Name, "integration": pol.Integration.Start, "checks": len(pol.Integration.Checks)})
+		res := integration.Run(ctx, e.Policy, dir, pol.Integration)
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+		passed := res.Passed && res.Err == ""
+		a := domain.Artifact{
+			Kind: domain.ArtIntegrationRun, Title: title + ": " + pol.Integration.Start, Repo: r.Name,
+			Command: pol.Integration.Start, Passed: boolp(passed), Output: res.Output, Redacted: res.Redacted,
+			Tests: res.Checks, TestsParsed: true, Producer: "engine.integration",
+		}
+		if res.Err != "" {
+			a.ExitCode = -1
+		}
+		e.bindSource(ctx, t, &a, heads, dirty)
+		a = e.addArtifact(t, a)
+		out = append(out, a)
+		if passed {
+			e.emit(t.ID, domain.EvTestsPassed, map[string]any{"repo": r.Name, "integration": pol.Integration.Start, "checks": len(res.Checks)})
+		} else {
+			e.emit(t.ID, domain.EvTestsFailed, map[string]any{"repo": r.Name, "integration": pol.Integration.Start, "output_tail": tailStr(res.Output, 1500), "error": res.Err})
+		}
+	}
+	return out, nil
+}
+
 // runBaseline executes the repro/test commands on the untouched worktrees
 // exactly once per task and records the outcome as artifacts. For bugfix
 // tasks a failing baseline is the reproduction; a passing one is recorded as
@@ -255,6 +342,9 @@ func (e *Engine) runBaseline(ctx context.Context, t *domain.Task) error {
 			}
 		}
 	}
+	if _, err := e.runIntegration(ctx, t, "integration baseline"); err != nil {
+		return err
+	}
 	t.State.Baseline = results
 	t.State.BaselineDone = true
 	if ran == 0 {
@@ -288,7 +378,7 @@ func (e *Engine) snapshotPacket(t *domain.Task) (*domain.Packet, error) {
 	decisions, _ := e.Store.Decisions(t.ID)
 	in := proof.Input{
 		Task: t, Artifacts: arts, Evidence: evidence, Runs: runs, Decisions: decisions,
-		FileExists: proof.WorktreeFileExists(t),
+		FileExists: proof.WorktreeFileExists(t), IntegrationConfigured: e.integrationConfigured(t),
 	}
 	if t.State.WorktreeRoot != "" {
 		if heads, dirty, err := e.WS.Heads(context.Background(), t); err == nil {

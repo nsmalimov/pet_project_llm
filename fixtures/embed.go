@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-//go:embed reservations/*.fixture
+//go:embed reservations/*.fixture reservations/cmd/server/*.fixture
 var Reservations embed.FS
 
 // Materialize writes the reservations fixture into dir and commits it as a
@@ -22,19 +22,25 @@ func Materialize(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	entries, err := fs.ReadDir(Reservations, "reservations")
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		b, err := Reservations.ReadFile("reservations/" + e.Name())
+	// Files carry a .fixture suffix so the buggy code is neither a nested
+	// module nor part of ./... in this repository.
+	err := fs.WalkDir(Reservations, "reservations", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, err := Reservations.ReadFile(p)
 		if err != nil {
 			return err
 		}
-		name := strings.TrimSuffix(e.Name(), ".fixture") // files carry a .fixture suffix so the buggy code is neither a nested module nor part of ./...
-		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+		rel := strings.TrimSuffix(strings.TrimPrefix(p, "reservations/"), ".fixture")
+		dst := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
 		}
+		return os.WriteFile(dst, b, 0o644)
+	})
+	if err != nil {
+		return err
 	}
 	for _, args := range [][]string{
 		{"init", "-q"},

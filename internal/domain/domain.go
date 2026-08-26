@@ -195,6 +195,16 @@ type Task struct {
 	State   TaskState `json:"state"`
 }
 
+// AuditRecord is one sensitive action: who did what to which resource.
+type AuditRecord struct {
+	At        time.Time `json:"at"`
+	Actor     string    `json:"actor"`
+	Action    string    `json:"action"` // case.create | case.run | case.cancel | case.reverify | decision.resolve | verdict.record | repo.add | repo.policy | github.post
+	Workspace string    `json:"workspace,omitempty"`
+	Resource  string    `json:"resource"`
+	Detail    string    `json:"detail,omitempty"`
+}
+
 // ExternalEffect records an intent to cause a side effect outside Proofline
 // (GitHub status, comment) so a crash between the effect and the local
 // commit is detectable: a pending intent on retry means "unknown whether it
@@ -361,6 +371,9 @@ const (
 	// changed code. Guards against a fix that only satisfies tests the author
 	// rewrote.
 	ArtOriginalTestsRun ArtifactKind = "original_tests_run"
+	// ArtIntegrationRun: the service started from the worktree and probed
+	// over HTTP with approved checks; per-check results in Tests.
+	ArtIntegrationRun ArtifactKind = "integration_run"
 )
 
 // Artifact is an immutable, append-only piece of raw evidence.
@@ -589,6 +602,15 @@ type ReviewOutput struct {
 }
 
 // ---------- IDs ----------
+
+// NewIDNumber returns a random uint32 (ports, jitter).
+func NewIDNumber() uint32 {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
 
 // NewID returns a short random identifier with a type prefix, e.g. "task_a1b2c3d4".
 func NewID(prefix string) string {

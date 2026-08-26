@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"orchestrator/examples"
 	"orchestrator/fixtures"
@@ -131,8 +133,45 @@ func (s *Server) requestedWorkspace(r *http.Request, p *auth.Principal) string {
 	return ""
 }
 
+// audit records a sensitive action for the principal of r.
+func (s *Server) audit(r *http.Request, action, workspace, resource, detail string) {
+	p := principalOf(r)
+	actor := "anonymous"
+	if p != nil {
+		actor = p.UserID
+	}
+	_ = s.Engine.Store.AddAudit(domain.AuditRecord{At: time.Now().UTC(), Actor: actor, Action: action, Workspace: workspace, Resource: resource, Detail: detail})
+}
+
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
+	p := principalOf(r)
+	writeJSON(w, http.StatusOK, map[string]any{"user_id": p.UserID, "name": p.Name, "roles": p.Roles, "local_mode": s.Auth == nil || !s.Auth.Configured()})
+}
+
+func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
+	all, err := s.Engine.Store.Audit(500)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	p := principalOf(r)
+	out := []domain.AuditRecord{}
+	for _, a := range all {
+		ws := a.Workspace
+		if ws == "" {
+			ws = LocalWorkspace
+		}
+		if p.Can(auth.ActManageMembers, ws) || p.Can(auth.ActManageRepos, ws) {
+			out = append(out, a)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /whoami", s.protect(auth.ActView, s.whoami))
+	mux.HandleFunc("GET /audit", s.protect(auth.ActView, s.getAudit))
 	mux.HandleFunc("POST /tasks", s.protect(auth.ActCreate, s.createTask))
 	mux.HandleFunc("GET /tasks", s.protect(auth.ActView, s.listTasks))
 	mux.HandleFunc("GET /tasks/{id}", s.protect(auth.ActView, s.getTask))
@@ -155,6 +194,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /tasks/{id}/reverify", s.protect(auth.ActCreate, s.reverifyTask))
 	mux.HandleFunc("GET /repos", s.protect(auth.ActView, s.listRepos))
 	mux.HandleFunc("POST /repos", s.protect(auth.ActManageRepos, s.addRepo))
+	mux.HandleFunc("PUT /repos/{rid}/policy", s.protect(auth.ActManageRepos, s.setRepoPolicy))
 	mux.HandleFunc("POST /github/import", s.protect(auth.ActCreate, s.githubImport))
 	// Webhook: authenticated by HMAC signature, scoped by the repository link.
 	mux.HandleFunc("POST /github/webhook", s.githubWebhook)
@@ -165,6 +205,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /new", s.ui)
 	mux.HandleFunc("GET /repos-ui", s.ui)
 	mux.HandleFunc("GET /help", s.ui)
+	mux.HandleFunc("GET /audit-ui", s.ui)
 	return mux
 }
 
@@ -219,6 +260,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, t) // replayed: no second run
 		return
 	}
+	s.audit(r, "case.create", s.scopeOf(t), t.ID, t.Goal)
 	if req.Start == nil || *req.Start {
 		s.runAsync(t.ID)
 	}
@@ -244,6 +286,7 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "task is not running in this process"})
 		return
 	}
+	s.audit(r, "case.cancel", "", id, "")
 	writeJSON(w, http.StatusAccepted, map[string]string{"task": id, "status": "cancelling"})
 }
 
@@ -287,6 +330,10 @@ func (s *Server) runExample(w http.ResponseWriter, r *http.Request) {
 	rp, err := s.Engine.Repos.Add(dir, ws)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := s.Engine.Repos.SetPolicy(rp.ID, examplePolicy()); err != nil {
+		writeErr(w, err)
 		return
 	}
 	t, err := s.Engine.CreateTaskSpec(engine.TaskSpec{
@@ -368,6 +415,7 @@ func (s *Server) resolveDecision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	s.audit(r, "decision.resolve", s.scopeOf(t), t.ID, r.PathValue("did")+" → "+req.Option)
 	if !t.Status.Terminal() {
 		s.runAsync(t.ID)
 	}
@@ -447,7 +495,13 @@ func (s *Server) postVerdict(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json: " + err.Error()})
 		return
 	}
+	if p := principalOf(r); p != nil && req.By == "" {
+		req.By = p.Name
+	}
 	v, err := s.Engine.RecordVerdict(r.PathValue("id"), req.Decision, req.Note, req.By, req.PacketVersion)
+	if err == nil {
+		s.audit(r, "verdict.record", "", r.PathValue("id"), fmt.Sprintf("%s on packet v%d", v.Decision, v.PacketVersion))
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, engine.ErrTaskRunning), errors.Is(err, engine.ErrPacketChanged):
@@ -500,7 +554,7 @@ func (s *Server) system(w http.ResponseWriter, r *http.Request) {
 		"github_connected": s.GitHub != nil && s.GitHub.Token != "", "webhook_configured": s.WebhookSecret != "",
 		"executors": execs, "examples_enabled": s.ExampleRoot != "",
 		"auth_configured":    s.Auth != nil && s.Auth.Configured(),
-		"integration_runner": "not configured",
+		"integration_runner": "http-checks (repository policy)",
 	})
 }
 
@@ -545,6 +599,7 @@ func (s *Server) addRepo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	s.audit(r, "repo.add", ws, rp.ID, rp.Path)
 	writeJSON(w, http.StatusCreated, rp)
 }
 
@@ -621,6 +676,7 @@ func (s *Server) githubPost(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	effs, err := s.Engine.PostGitHubStatus(r.Context(), s.GitHub, id, s.PublicURL+"/cases/"+id)
+	s.audit(r, "github.post", "", id, fmt.Sprintf("%d effect(s), err=%v", len(effs), err))
 	if err != nil {
 		code := http.StatusBadGateway
 		if errors.Is(err, engine.ErrEffectUnknown) {
@@ -654,6 +710,58 @@ func (s *Server) reverifyTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, map[string]string{"error": err.Error()})
 		return
 	}
+	s.audit(r, "case.reverify", s.scopeOf(t), t.ID, "")
 	s.runAsync(t.ID)
 	writeJSON(w, http.StatusAccepted, t)
+}
+
+func (s *Server) setRepoPolicy(w http.ResponseWriter, r *http.Request) {
+	if s.Engine.Repos == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no repository registry"})
+		return
+	}
+	rp, err := s.Engine.Repos.Get(r.PathValue("rid"))
+	if err != nil {
+		writeErr(w, store.ErrNotFound)
+		return
+	}
+	ws := rp.Workspace
+	if ws == "" {
+		ws = LocalWorkspace
+	}
+	if !principalOf(r).Can(auth.ActManageRepos, ws) {
+		writeErr(w, store.ErrNotFound)
+		return
+	}
+	var pol repos.Policy
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&pol); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad json: " + err.Error()})
+		return
+	}
+	if err := s.Engine.Repos.SetPolicy(rp.ID, &pol); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.audit(r, "repo.policy", ws, rp.ID, "")
+	rp, _ = s.Engine.Repos.Get(rp.ID)
+	writeJSON(w, http.StatusOK, rp)
+}
+
+// examplePolicy is the verification policy of the reservations fixture:
+// repro + suite, and a real integration check against the HTTP handler
+// (two bookings for the same UTC day from different zones must conflict).
+func examplePolicy() *repos.Policy {
+	port := 18000 + int(domain.NewIDNumber()%2000)
+	return &repos.Policy{
+		TestCommand:  "go test ./...",
+		ReproCommand: examples.ReproCommand,
+		Integration: &repos.IntegrationCheck{
+			Start: "go run ./cmd/server", Port: port, StartupSeconds: 90,
+			Checks: []repos.HTTPCheck{
+				{Name: "health", Method: "GET", Path: "/healthz", ExpectStatus: 200, ExpectBody: "ok"},
+				{Name: "first booking accepted", Method: "POST", Path: "/reserve", Body: `{"room":"101","day":"2026-03-14T23:30:00-04:00"}`, ExpectStatus: 200},
+				{Name: "same UTC day from another zone rejected", Method: "POST", Path: "/reserve", Body: `{"room":"101","day":"2026-03-15T10:00:00Z"}`, ExpectStatus: 409},
+			},
+		},
+	}
 }

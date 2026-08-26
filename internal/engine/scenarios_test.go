@@ -150,23 +150,12 @@ type matrixRow struct {
 
 func runScenario(t *testing.T, sc scenario) matrixRow {
 	tmp := t.TempDir()
-	dir := filepath.Join(tmp, "reservations")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"go.mod", "store.go", "store_test.go", "handler.go"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(readFixture(t, name)), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	dir := fixtureRepo(t, tmp)
 	if sc.Prepare != nil {
 		sc.Prepare(t, dir)
+		gitRun(t, dir, "add", "-A")
+		gitRun(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "prepared")
 	}
-	gitRun(t, dir, "init", "-q")
-	gitRun(t, dir, "config", "user.email", "test@test")
-	gitRun(t, dir, "config", "user.name", "test")
-	gitRun(t, dir, "add", "-A")
-	gitRun(t, dir, "commit", "-q", "-m", "buggy")
 
 	e := newTestEngine(t, &executor.ScriptExecutor{Steps: sc.Steps}, filepath.Join(tmp, "data"))
 	if sc.Cfg != nil {
