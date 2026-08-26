@@ -47,13 +47,26 @@ type Input struct {
 	FileExists func(repoRelPath string) bool
 }
 
+// RelativeInsideWorktree rejects agent-supplied paths that leave the worktree.
+var RelativeInsideWorktree = func(root, rel string) (string, error) {
+	clean := filepath.Clean(rel)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes worktree")
+	}
+	return filepath.Join(root, filepath.FromSlash(clean)), nil
+}
+
 // WorktreeFileExists returns a FileExists func bound to a task's worktree.
 func WorktreeFileExists(t *domain.Task) func(string) bool {
 	return func(p string) bool {
 		if t.State.WorktreeRoot == "" {
 			return false
 		}
-		_, err := os.Stat(filepath.Join(t.State.WorktreeRoot, filepath.FromSlash(p)))
+		full, err := RelativeInsideWorktree(t.State.WorktreeRoot, p)
+		if err != nil {
+			return false
+		}
+		_, err = os.Stat(full)
 		return err == nil
 	}
 }
@@ -237,7 +250,14 @@ func (b *builder) claimReproduced() domain.Claim {
 		return c
 	}
 	c.ArtifactIDs = ids(repro)
+	// Prefer a failing baseline (multi-repo: the bug lives in one repo).
 	a := repro[0]
+	for _, x := range repro {
+		if x.Passed != nil && !*x.Passed {
+			a = x
+			break
+		}
+	}
 	if a.Passed != nil && *a.Passed && a.Tests != nil && len(a.Tests) == 0 {
 		c.Status = domain.ClaimInsufficient
 		c.Statement = fmt.Sprintf("`%s` executed no test on the unchanged code.", a.Command)
@@ -246,10 +266,27 @@ func (b *builder) claimReproduced() domain.Claim {
 		return c
 	}
 	if a.Passed != nil && *a.Passed {
+		if b.t.ReproCommand == "" {
+			// No explicit reproduction was configured; a green suite before
+			// the change is a missing proof, not a contradiction (the fix may
+			// add the regression test itself).
+			c.Status = domain.ClaimInsufficient
+			c.Statement = fmt.Sprintf("`%s` passes on the unchanged code; no test reproduces the reported problem.", a.Command)
+			c.Reason = "no reproduction command was configured, so nothing on the baseline demonstrates the bug"
+			c.Gap = "a repro command / test that fails before the change"
+			return c
+		}
 		c.Status = domain.ClaimContradicted
 		c.Statement = fmt.Sprintf("`%s` PASSES on the unchanged code.", a.Command)
-		c.Reason = "the reproduction command does not exercise the reported bug, so a later pass proves nothing about it"
+		c.Reason = "the configured reproduction command does not exercise the reported bug, so a later pass proves nothing about it"
 		c.Gap = "a repro command / test that fails before the change"
+		return c
+	}
+	if a.Truncated {
+		c.Status = domain.ClaimInsufficient
+		c.Statement = fmt.Sprintf("`%s` failed on the unchanged code but its output was truncated.", a.Command)
+		c.Reason = "incomplete artifact"
+		c.Gap = "a baseline run whose full output fits the cap"
 		return c
 	}
 	c.Scope = fmt.Sprintf("repo %s, command `%s`", a.Repo, a.Command)
@@ -521,6 +558,12 @@ func (b *builder) claimChangeVerified() domain.Claim {
 	c.Status = domain.ClaimSupported
 	c.Statement = strings.Join(cmds, ", ") + " pass on the current code."
 	c.Reason = "real test run on the current source state"
+	for _, a := range b.tests {
+		if !a.TestsParsed {
+			c.Reason += "; test identity unverifiable for this runner (command-level pass only)"
+			break
+		}
+	}
 	return c
 }
 
@@ -582,7 +625,7 @@ func (b *builder) claimChallenge() domain.Claim {
 			high++
 		}
 	}
-	sameModel := b.diff != nil && b.diff.Model != "" && b.diff.Model == r.Model
+	sameModel := b.diff != nil && (b.diff.Model == r.Model || b.diff.Model == "" || r.Model == "")
 	switch {
 	case r.Verdict != "approve":
 		c.Status = domain.ClaimContradicted

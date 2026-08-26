@@ -181,11 +181,14 @@ type Task struct {
 	// the baseline and the existing change is verified and challenged.
 	HeadRef string `json:"head_ref,omitempty"`
 	// PR links the case to a pull request when it was created from one.
-	PR            *PullRequestRef `json:"pr,omitempty"`
-	Status        TaskStatus      `json:"status"`
-	FailureReason string          `json:"failure_reason,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	PR *PullRequestRef `json:"pr,omitempty"`
+	// Scenario marks a Local Pilot example: agents are scripted (executor
+	// "scenario"); engine, worktree, commands and packet are real.
+	Scenario      string     `json:"scenario,omitempty"`
+	Status        TaskStatus `json:"status"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 	// Version is the optimistic-concurrency counter of the snapshot. Every
 	// SaveTask must present the version it read; a mismatch is a conflict.
 	Version int       `json:"version"`
@@ -255,6 +258,7 @@ const (
 	EvVerdictRecorded   = "verdict.recorded"
 	EvHeadApplied       = "workspace.head_applied" // verify-only mode: worktree moved to the head ref
 	EvPolicyViolation   = "policy.violation"       // hostile repository content / escape attempt; task blocked
+	EvTaskCancelled     = "task.cancelled"
 )
 
 // ---------- Decisions ----------
@@ -509,6 +513,8 @@ type Packet struct {
 	Confidence     string   `json:"confidence"` // strongest evidence level (legacy chain)
 	// ExecMode states the execution boundary the evidence was produced under.
 	ExecMode string `json:"exec_mode,omitempty"`
+	// Live marks an unpersisted preview built while the workflow runs.
+	Live bool `json:"live,omitempty"`
 }
 
 // Verdict is the human merge decision on a packet version. It is recorded

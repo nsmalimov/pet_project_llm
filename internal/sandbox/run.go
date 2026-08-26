@@ -264,7 +264,7 @@ func (p Policy) sbplProfile(dir string, spec Spec) (string, error) {
 		// The LLM CLI needs its config/state, the login keychain and network.
 		fmt.Fprintf(&sb, "(allow file-read* file-write* (subpath %q) (literal %q) (literal %q) (subpath %q) (subpath %q) (subpath %q))\n",
 			filepath.Join(home, ".claude"), filepath.Join(home, ".claude.json"), filepath.Join(home, ".claude.json.backup"),
-			filepath.Join(home, ".npm"), filepath.Join(home, "Library", "Caches"), filepath.Join(home, "Library", "Application Support"))
+			filepath.Join(home, ".npm"), filepath.Join(home, "Library", "Caches", "claude-cli-nodejs"), filepath.Join(home, "Library", "Application Support", "Claude"))
 		fmt.Fprintf(&sb, "(allow file-read* (subpath %q) (subpath %q) (subpath %q))\n",
 			filepath.Join(home, "Library", "Keychains"), "/Library/Keychains", filepath.Join(home, "Library", "Preferences"))
 		sb.WriteString("(allow file-write* (subpath \"" + filepath.Join(home, "Library", "Keychains") + "\"))\n")

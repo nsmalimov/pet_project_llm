@@ -35,8 +35,16 @@ type TaskSpec struct {
 	// WorkspaceID is the authorization scope; when a repository registry is
 	// used, every repo must belong to this workspace (or be unscoped).
 	WorkspaceID string
-	forcedID    string
+	// PinnedBase is the commit worktrees are created from (PR base).
+	PinnedBase string
+	// Scenario marks a Local Pilot example (scripted agents).
+	Scenario string
+	forcedID string
 }
+
+// safeRef: a SHA or a plain branch/tag name — never something git could read
+// as an option.
+var safeRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$`)
 
 // CreateTaskIdempotent is CreateTaskSpec with duplicate suppression. The
 // second return value reports whether an existing task was returned.
@@ -48,7 +56,7 @@ func (e *Engine) CreateTaskIdempotent(spec TaskSpec) (*domain.Task, bool, error)
 	// Reserve the key with a provisional ID first so two concurrent creators
 	// cannot both create; the loser returns the winner's task.
 	id := domain.NewID("task")
-	owner, dup, err := e.Store.ClaimIdempotencyKey(spec.IdempotencyKey, id)
+	owner, dup, err := e.Store.ClaimIdempotencyKey(spec.WorkspaceID+"|"+spec.IdempotencyKey, id)
 	if err != nil {
 		return nil, false, err
 	}
@@ -108,6 +116,7 @@ func (e *Engine) CreateTaskSpec(spec TaskSpec) (*domain.Task, error) {
 		return nil, err
 	}
 	t.WorkspaceID = spec.WorkspaceID
+	t.Scenario = spec.Scenario
 	t.ReproCommand = strings.TrimSpace(spec.ReproCommand)
 	if t.ReproCommand != "" {
 		if _, err := e.Policy.ValidateCommand(t.ReproCommand); err != nil {
@@ -115,6 +124,15 @@ func (e *Engine) CreateTaskSpec(spec TaskSpec) (*domain.Task, error) {
 		}
 	}
 	t.HeadRef = strings.TrimSpace(spec.HeadRef)
+	if t.HeadRef != "" && !safeRef.MatchString(t.HeadRef) {
+		return nil, fmt.Errorf("head ref %q is not a safe git ref", t.HeadRef)
+	}
+	if spec.PinnedBase != "" {
+		if !safeRef.MatchString(spec.PinnedBase) {
+			return nil, fmt.Errorf("base %q is not a safe git ref", spec.PinnedBase)
+		}
+		t.State.PinnedBase = spec.PinnedBase
+	}
 	t.PR = spec.PR
 	t.Kind = spec.Kind
 	if t.Kind == "" {
@@ -281,6 +299,19 @@ func (e *Engine) snapshotPacket(t *domain.Task) (*domain.Packet, error) {
 	}
 	fresh := proof.Build(in)
 	fresh.ExecMode = string(e.Policy.Mode)
+	if t.Status.Active() {
+		// While the engine is running, the tree changes constantly; a
+		// persisted version per poll would be noise and would race the
+		// worker's own snapshot. Return the latest persisted version, or a
+		// live preview (version 0) if none exists.
+		if existing, err := e.Store.Packets(t.ID); err == nil && len(existing) > 0 {
+			l := existing[len(existing)-1]
+			l.Live = true
+			return &l, nil
+		}
+		fresh.Live = true
+		return &fresh, nil
+	}
 	var p domain.Packet
 	err = e.Store.WithPacketLock(t.ID, func() error {
 		existing, err := e.Store.Packets(t.ID)

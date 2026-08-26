@@ -97,12 +97,21 @@ func Verbose(command string) string {
 		return "go test -v " + strings.Join(fields[2:], " ")
 	}
 	if isPytest(fields) {
+		var out []string
+		verbose := false
 		for _, f := range fields {
-			if f == "-v" || f == "-vv" || f == "--verbose" {
-				return command
+			if f == "-q" || f == "--quiet" {
+				continue // -q cancels -v (pytest verbosity = verbose - quiet)
 			}
+			if f == "-v" || f == "-vv" || f == "--verbose" {
+				verbose = true
+			}
+			out = append(out, f)
 		}
-		return command + " -v"
+		if !verbose {
+			out = append(out, "-v")
+		}
+		return strings.Join(out, " ")
 	}
 	return command
 }

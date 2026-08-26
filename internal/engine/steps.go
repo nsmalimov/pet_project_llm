@@ -10,6 +10,7 @@ import (
 	"orchestrator/internal/proof"
 	"orchestrator/internal/roles"
 	"orchestrator/internal/router"
+	"orchestrator/internal/sandbox"
 	"orchestrator/internal/verify"
 )
 
@@ -47,7 +48,7 @@ func (e *Engine) stepUnderstand(ctx context.Context, t *domain.Task) error {
 	}
 
 	t.State.Uncertainty = out.Uncertainty
-	t.State.ResearchSummary = out.Summary
+	t.State.ResearchSummary, _ = sandbox.Redact(out.Summary)
 	t.State.KeyFiles = out.KeyFiles
 	e.recordResearch(t, run.ID, out)
 
@@ -175,7 +176,7 @@ func (e *Engine) stepImplement(ctx context.Context, t *domain.Task) error {
 		return err
 	}
 	t.State.ImplementAttempts++
-	t.State.DeveloperSummary = out.Summary
+	t.State.DeveloperSummary, _ = sandbox.Redact(out.Summary)
 	t.State.AuthorModel = rt.Model
 
 	diff, files, derr := e.WS.Diff(ctx, t)
@@ -300,11 +301,20 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 	t.State.LastTests = results
 
 	// If the author touched test files, replay the ORIGINAL tests against the
-	// changed code. A fix that only satisfies rewritten tests is not verified.
+	// changed code. A fix that only satisfies rewritten tests is not verified;
+	// a failing replay is fed back to the developer like any failing test.
 	if allPassed(results) {
-		if err := e.replayOriginalTests(ctx, t); err != nil {
+		replay, err := e.replayOriginalTests(ctx, t)
+		if err != nil {
 			return err
 		}
+		for _, r := range replay {
+			if !r.Passed {
+				r.Command = "ORIGINAL TESTS vs your change: " + r.Command
+				results = append(results, r)
+			}
+		}
+		t.State.LastTests = results
 	}
 
 	if ran == 0 {
@@ -336,6 +346,7 @@ func (e *Engine) stepVerify(ctx context.Context, t *domain.Task) error {
 			Reason:     summarizeTests(results),
 			Options: []domain.DecisionOption{
 				{ID: "retry", Label: "Keep trying", Detail: "add guidance in the note"},
+				{ID: "stop", Label: "Stop and keep the packet as-is", Detail: "the contradiction stays on record for the human decision", Effect: "accept"},
 				{ID: "abort", Label: "Abort the task", Effect: "abort"},
 			},
 		}, domain.StatusImplementing, "tester")
@@ -436,7 +447,7 @@ func (e *Engine) stepReview(ctx context.Context, t *domain.Task) error {
 
 // replayOriginalTests runs the repro/test commands with the pre-change
 // versions of every changed test file. Records original_tests_run artifacts.
-func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) error {
+func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) ([]domain.TestResult, error) {
 	var testFiles []string
 	for _, f := range t.State.ChangedFiles {
 		if proof.IsTestFile(f) {
@@ -444,14 +455,15 @@ func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) error 
 		}
 	}
 	if len(testFiles) == 0 {
-		return nil
+		return nil, nil
 	}
+	var replayed []domain.TestResult
 	e.emit(t.ID, domain.EvTestsStarted, map[string]any{"replay_original_tests": testFiles})
 	// The replay temporarily swaps files, so capture the source state before
 	// the swap: the artifact describes the committed HEAD, not the swap.
 	heads, dirty, herr := e.WS.Heads(ctx, t)
 	if herr != nil {
-		return herr
+		return nil, herr
 	}
 	var runErr error
 	err := e.WS.WithOriginalFiles(ctx, t, testFiles, func() error {
@@ -467,6 +479,7 @@ func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) error 
 				a.Files = testFiles
 				a.SourceSHAs, a.SourceDirty = heads, dirty
 				e.addArtifact(t, a)
+				replayed = append(replayed, res)
 				if !res.Passed {
 					e.emit(t.ID, domain.EvWarning, map[string]any{
 						"warning": "original tests fail against the changed code", "command": c.Cmd, "output_tail": tailStr(res.OutputTail, 1500),
@@ -477,9 +490,9 @@ func (e *Engine) replayOriginalTests(ctx context.Context, t *domain.Task) error 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("replay original tests: %w", err)
+		return nil, fmt.Errorf("replay original tests: %w", err)
 	}
-	return runErr
+	return replayed, runErr
 }
 
 func (e *Engine) completeTask(t *domain.Task) error {

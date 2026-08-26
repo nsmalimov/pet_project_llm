@@ -95,11 +95,17 @@ func (p Policy) ValidateCommand(cmd string) ([]string, error) {
 		return nil, fmt.Errorf("%w: runner must be a bare name, got %q", ErrCommandPolicy, runner)
 	}
 	for _, a := range argv[1:] {
+		if strings.HasPrefix(a, "--") {
+			a = a[1:] // "--exec=" and "-exec=" are the same flag to go
+		}
 		if strings.HasPrefix(a, "-exec") || a == "-toolexec" || strings.HasPrefix(a, "-toolexec=") || strings.HasPrefix(a, "-exec=") {
 			return nil, fmt.Errorf("%w: %q would execute an arbitrary program", ErrCommandPolicy, a)
 		}
 		if strings.HasPrefix(a, "-c") && (runner == "python3" || runner == "python") {
 			return nil, fmt.Errorf("%w: python -c is arbitrary code", ErrCommandPolicy)
+		}
+		if a == "-ldflags" || strings.HasPrefix(a, "-ldflags=") || a == "-gcflags" || strings.HasPrefix(a, "-gcflags=") {
+			return nil, fmt.Errorf("%w: %q not allowed", ErrCommandPolicy, a)
 		}
 	}
 	return argv, nil

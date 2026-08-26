@@ -9,6 +9,7 @@ import (
 
 	"orchestrator/internal/domain"
 	"orchestrator/internal/github"
+	"orchestrator/internal/store"
 )
 
 // GitHub semantics live here so they can be tested against a fake server
@@ -47,27 +48,19 @@ func (e *Engine) ImportPR(ctx context.Context, pr *github.PullRequest, idempoten
 	if goal == "" {
 		goal = fmt.Sprintf("Verify %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
 	}
-	key := idempotencyKey
-	if key == "" {
-		key = fmt.Sprintf("pr|%s/%s#%d|%s", pr.Owner, pr.Repo, pr.Number, pr.HeadSHA)
+	// The semantic key (PR + exact head) is what makes two deliveries the
+	// same case; the delivery ID is only metadata.
+	key := fmt.Sprintf("pr|%s/%s#%d|%s", pr.Owner, pr.Repo, pr.Number, pr.HeadSHA)
+	ctxSrcs := nonEmpty(pr.Body)
+	if idempotencyKey != "" {
+		ctxSrcs = append(ctxSrcs, "github delivery "+idempotencyKey)
 	}
 	spec := TaskSpec{
-		Goal: goal, Context: nonEmpty(pr.Body), Repos: []string{local.ID},
-		HeadRef: pr.HeadSHA, IdempotencyKey: key, WorkspaceID: local.Workspace,
+		Goal: goal, Context: ctxSrcs, Repos: []string{local.ID},
+		HeadRef: pr.HeadSHA, IdempotencyKey: key, WorkspaceID: local.Workspace, PinnedBase: pr.BaseSHA,
 		PR: &domain.PullRequestRef{Owner: pr.Owner, Repo: pr.Repo, Number: pr.Number, URL: pr.URL, BaseSHA: pr.BaseSHA, HeadSHA: pr.HeadSHA},
 	}
-	t, existing, err := e.CreateTaskIdempotent(spec)
-	if err != nil {
-		return nil, false, err
-	}
-	if !existing {
-		// The base of the verification must be the PR base, not whatever the
-		// local clone's HEAD is. Worktrees are created from HEAD, so pin it.
-		if err := e.pinBase(ctx, t, local.Path, pr.BaseSHA); err != nil {
-			return nil, false, err
-		}
-	}
-	return t, existing, nil
+	return e.CreateTaskIdempotent(spec)
 }
 
 func nonEmpty(s string) []string {
@@ -75,13 +68,6 @@ func nonEmpty(s string) []string {
 		return nil
 	}
 	return []string{s}
-}
-
-// pinBase records the PR base SHA as the task's intended base. Prepare()
-// honours State.PinnedBase when creating worktrees.
-func (e *Engine) pinBase(ctx context.Context, t *domain.Task, repoPath, baseSHA string) error {
-	t.State.PinnedBase = baseSHA
-	return e.Store.SaveTask(t)
 }
 
 // findCaseForHead returns the newest task linked to the same PR head SHA.
@@ -136,7 +122,12 @@ func (e *Engine) RefreshPR(ctx context.Context, c *github.Client, owner, repo st
 			if t.Status.Terminal() {
 				continue
 			}
-			_ = e.failTask(t, "BLOCKED: GitHub access to "+owner+"/"+repo+" revoked or repository not visible ("+err.Error()+")")
+			reason := "BLOCKED: GitHub access to " + owner + "/" + repo + " revoked or repository not visible (" + err.Error() + ")"
+			if ferr := e.failTask(t, reason); errors.Is(ferr, store.ErrConflict) {
+				if fresh, gerr := e.Store.GetTask(t.ID); gerr == nil && !fresh.Status.Terminal() {
+					_ = e.failTask(fresh, reason)
+				}
+			}
 		}
 		return nil, err
 	}

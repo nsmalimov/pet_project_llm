@@ -81,3 +81,24 @@ func (s *ScriptExecutor) Run(_ context.Context, req Request) (Result, error) {
 	}
 	return Result{Output: step.Output, NumTurns: 1, DurationMS: 1}, nil
 }
+
+// ScenarioExecutor dispatches to a named ScriptExecutor chosen per request
+// (Request.Scenario). Used for Local Pilot example cases: the engine, the
+// worktrees, the commands and the packet are real; only the agents' replies
+// are scripted, and every case created this way is labelled as such.
+type ScenarioExecutor struct {
+	Lookup func(name string) (*ScriptExecutor, error)
+}
+
+func (s *ScenarioExecutor) Name() string { return "scenario" }
+
+func (s *ScenarioExecutor) Run(ctx context.Context, req Request) (Result, error) {
+	if req.Scenario == "" {
+		return Result{}, fmt.Errorf("scenario executor: request has no scenario")
+	}
+	sc, err := s.Lookup(req.Scenario)
+	if err != nil {
+		return Result{}, err
+	}
+	return sc.Run(ctx, req)
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"orchestrator/internal/domain"
@@ -24,11 +25,14 @@ func fixtureRepo(t *testing.T, root string) string {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
+		if e.Name() == "embed.go" {
+			continue
+		}
 		b, err := os.ReadFile(filepath.Join(src, e.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, e.Name()), b, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, strings.TrimSuffix(e.Name(), ".fixture")), b, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -42,6 +46,9 @@ func fixtureRepo(t *testing.T, root string) string {
 
 func readFixture(t *testing.T, name string) string {
 	t.Helper()
+	if name == "go.mod" {
+		name = "go.mod.fixture"
+	}
 	b, err := os.ReadFile(filepath.Join("..", "..", "fixtures", "reservations", name))
 	if err != nil {
 		t.Fatal(err)

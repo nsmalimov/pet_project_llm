@@ -70,6 +70,7 @@ type Engine struct {
 
 	mu      sync.Mutex
 	running map[string]bool
+	cancels map[string]context.CancelFunc
 }
 
 var ErrAlreadyRunning = errors.New("task is already running")
@@ -198,10 +199,17 @@ func (e *Engine) RunTask(ctx context.Context, id string) error {
 		return ErrAlreadyRunning
 	}
 	e.running[id] = true
+	ctx, cancel := context.WithCancel(ctx)
+	if e.cancels == nil {
+		e.cancels = map[string]context.CancelFunc{}
+	}
+	e.cancels[id] = cancel
 	e.mu.Unlock()
 	defer func() {
+		cancel()
 		e.mu.Lock()
 		delete(e.running, id)
+		delete(e.cancels, id)
 		e.mu.Unlock()
 	}()
 
@@ -258,6 +266,12 @@ func (e *Engine) RunTask(ctx context.Context, id string) error {
 				// will mark the task interrupted.
 				return stepErr
 			}
+			if errors.Is(stepErr, store.ErrConflict) {
+				// Someone else (restart recovery, revocation, a resolve) moved
+				// the task under us. Their write wins; stop this loop.
+				e.emit(t.ID, domain.EvWarning, map[string]any{"warning": "engine step lost a concurrent update; stopping", "error": stepErr.Error()})
+				return stepErr
+			}
 			if errors.Is(stepErr, gitws.ErrHostileRepo) {
 				// Policy violations are not retried: the repository content
 				// itself is the problem. Block visibly.
@@ -281,6 +295,45 @@ func (e *Engine) RunTask(ctx context.Context, id string) error {
 			return nil
 		}
 	}
+}
+
+// Cancel stops a running task: the step's context is cancelled (child
+// process groups are killed by the sandbox), and once the loop has exited
+// the task is marked interrupted with a resume point. Returns false if the
+// task was not running in this process.
+func (e *Engine) Cancel(id string) bool {
+	e.mu.Lock()
+	cancel, ok := e.cancels[id]
+	e.mu.Unlock()
+	if !ok {
+		return false
+	}
+	cancel()
+	return true
+}
+
+// MarkInterrupted is called after a cancelled RunTask returned: an active
+// status becomes interrupted (never done), with the reason recorded.
+func (e *Engine) MarkInterrupted(id, reason string) {
+	t, err := e.Store.GetTask(id)
+	if err != nil || !t.Status.Active() {
+		return
+	}
+	t.State.ResumeStatus = t.Status
+	t.Status = domain.StatusInterrupted
+	if err := e.Store.SaveTask(t); err != nil {
+		return
+	}
+	e.emit(t.ID, domain.EvTaskCancelled, map[string]any{"was": string(t.State.ResumeStatus), "reason": reason})
+	runs, _ := e.Store.Runs(t.ID)
+	for _, r := range runs {
+		if r.Status == "running" {
+			now := time.Now().UTC()
+			r.Status, r.Error, r.FinishedAt = "interrupted", reason, &now
+			_ = e.Store.UpdateRun(&r)
+		}
+	}
+	_, _ = e.snapshotPacket(t)
 }
 
 func (e *Engine) failTask(t *domain.Task, reason string) error {
@@ -315,12 +368,32 @@ func (e *Engine) RecoverInterrupted() error {
 	}
 	for _, t := range tasks {
 		if t.Status.Active() {
+			// A task whose lease is held is alive in another process — never
+			// clobber it.
+			unlock, err := e.Store.LockTask(t.ID)
+			if err != nil {
+				continue
+			}
 			t.State.ResumeStatus = t.Status
 			t.Status = domain.StatusInterrupted
-			if err := e.Store.SaveTask(t); err != nil {
+			err = e.Store.SaveTask(t)
+			unlock()
+			if errors.Is(err, store.ErrConflict) {
+				continue // someone else moved it; not ours to touch
+			}
+			if err != nil {
 				return err
 			}
 			e.emit(t.ID, domain.EvTaskInterrupted, map[string]any{"was": string(t.State.ResumeStatus)})
+			// Close runs that will never finish.
+			runs, _ := e.Store.Runs(t.ID)
+			for _, r := range runs {
+				if r.Status == "running" {
+					now := time.Now().UTC()
+					r.Status, r.Error, r.FinishedAt = "interrupted", "process restarted mid-run", &now
+					_ = e.Store.UpdateRun(&r)
+				}
+			}
 		}
 	}
 	return nil
@@ -515,6 +588,10 @@ func (e *Engine) memoryRules(t *domain.Task) []string {
 
 // runAgent executes one agent invocation with full observability.
 func (e *Engine) runAgent(ctx context.Context, t *domain.Task, role string, prompt string, rt router.Route, attempt int) (executor.Result, *domain.AgentRun, error) {
+	if t.Scenario != "" {
+		rt.Executor = "scenario"
+		rt.Reason = "Local Pilot example: scripted agent replies (" + rt.Reason + ")"
+	}
 	exec, ok := e.Execs[rt.Executor]
 	if !ok {
 		return executor.Result{}, nil, fmt.Errorf("no executor registered under %q", rt.Executor)
@@ -534,7 +611,7 @@ func (e *Engine) runAgent(ctx context.Context, t *domain.Task, role string, prom
 	res, err := exec.Run(ctx, executor.Request{
 		Role: role, Prompt: prompt, WorkDir: t.State.WorktreeRoot,
 		Model: rt.Model, ReadOnly: roles.ReadOnly(role),
-		Timeout: e.Cfg.AgentTimeout, Attempt: attempt,
+		Timeout: e.Cfg.AgentTimeout, Attempt: attempt, Scenario: t.Scenario,
 	})
 
 	now := time.Now().UTC()
@@ -553,7 +630,7 @@ func (e *Engine) runAgent(ctx context.Context, t *domain.Task, role string, prom
 		return res, run, err
 	}
 	run.Status = "ok"
-	run.Summary = firstLine(res.Output, 200)
+	run.Summary, _ = sandbox.Redact(firstLine(res.Output, 200))
 	_ = e.Store.UpdateRun(run)
 	e.emit(t.ID, domain.EvAgentCompleted, map[string]any{
 		"run_id": run.ID, "role": role, "model": rt.Model, "duration_ms": run.DurationMS,

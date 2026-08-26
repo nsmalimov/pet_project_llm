@@ -33,9 +33,10 @@ type FileStore struct {
 }
 
 type taskLock struct {
-	mu      sync.Mutex
-	pmu     sync.Mutex // packet version serialisation
-	lastSeq int64      // 0 = unknown, recomputed lazily from events.jsonl
+	mu         sync.Mutex
+	pmu        sync.Mutex // packet version serialisation
+	eventsSize int64      // size of events.jsonl after our last append
+	lastSeq    int64      // 0 = unknown, recomputed lazily from events.jsonl
 }
 
 func NewFileStore(root string) (*FileStore, error) {
@@ -219,6 +220,15 @@ func (s *FileStore) ClaimIdempotencyKey(key, taskID string) (string, bool, error
 	return taskID, false, writeJSON(path, m)
 }
 
+func (s *FileStore) WithEffectsLock(taskID string, fn func() error) error {
+	unlock, err := s.fileLock(filepath.Join(s.taskDir(taskID), ".effects"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn()
+}
+
 func (s *FileStore) AddEffect(e domain.ExternalEffect) error {
 	return appendJSONL(filepath.Join(s.taskDir(e.TaskID), "effects.jsonl"), e)
 }
@@ -268,8 +278,19 @@ func (s *FileStore) AppendEvent(taskID, typ string, data map[string]any) (domain
 	l := s.lockFor(taskID)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	path := filepath.Join(s.taskDir(taskID), "events.jsonl")
+	// Cross-process: another process may have appended since we cached
+	// lastSeq. Hold the task's .cas flock and recompute when the file grew.
+	unlock, err := s.fileLock(filepath.Join(s.taskDir(taskID), ".cas"))
+	if err != nil {
+		return domain.Event{}, err
+	}
+	defer unlock()
+	if st, err := os.Stat(path); err == nil && st.Size() != l.eventsSize {
+		l.lastSeq = 0
+	}
 	if l.lastSeq == 0 {
-		evs, err := readJSONL[domain.Event](filepath.Join(s.taskDir(taskID), "events.jsonl"))
+		evs, err := readJSONL[domain.Event](path)
 		if err != nil {
 			return domain.Event{}, err
 		}
@@ -281,8 +302,11 @@ func (s *FileStore) AppendEvent(taskID, typ string, data map[string]any) (domain
 	}
 	l.lastSeq++
 	ev := domain.Event{Seq: l.lastSeq, TaskID: taskID, Type: typ, At: time.Now().UTC(), Data: data}
-	if err := appendJSONL(filepath.Join(s.taskDir(taskID), "events.jsonl"), ev); err != nil {
+	if err := appendJSONL(path, ev); err != nil {
 		return domain.Event{}, err
+	}
+	if st, err := os.Stat(path); err == nil {
+		l.eventsSize = st.Size()
 	}
 	return ev, nil
 }
@@ -399,6 +423,15 @@ func (s *FileStore) readDecisions(taskID string) ([]domain.Decision, error) {
 }
 
 func (s *FileStore) CreateDecision(d *domain.Decision) error {
+	unlock, err := s.fileLock(filepath.Join(s.taskDir(d.TaskID), ".cas"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.createDecision(d)
+}
+
+func (s *FileStore) createDecision(d *domain.Decision) error {
 	l := s.lockFor(d.TaskID)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -411,6 +444,21 @@ func (s *FileStore) CreateDecision(d *domain.Decision) error {
 }
 
 func (s *FileStore) SaveDecision(d *domain.Decision) error {
+	unlock, err := s.fileLock(filepath.Join(s.taskDir(d.TaskID), ".cas"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if d.Status == "resolved" {
+		cur, err := s.GetDecision(d.TaskID, d.ID)
+		if err == nil && cur.Status != "open" {
+			return fmt.Errorf("decision %s is already %s", d.ID, cur.Status)
+		}
+	}
+	return s.saveDecision(d)
+}
+
+func (s *FileStore) saveDecision(d *domain.Decision) error {
 	l := s.lockFor(d.TaskID)
 	l.mu.Lock()
 	defer l.mu.Unlock()

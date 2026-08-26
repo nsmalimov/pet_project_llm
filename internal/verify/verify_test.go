@@ -15,7 +15,7 @@ func TestVerboseInjection(t *testing.T) {
 		"go test ./...":            "go test -v ./...",
 		"go test -run TestX ./...": "go test -v -run TestX ./...",
 		"go test -v ./...":         "go test -v ./...",
-		"python3 -m pytest -q":     "python3 -m pytest -q -v",
+		"python3 -m pytest -q":     "python3 -m pytest -v",
 		"pytest tests/ -v":         "pytest tests/ -v",
 		"npm test --silent":        "npm test --silent",
 		"make test":                "make test",

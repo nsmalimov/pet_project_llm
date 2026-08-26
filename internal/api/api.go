@@ -5,19 +5,24 @@ package api
 import (
 	"context"
 	_ "embed"
-
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
-	"orchestrator/internal/auth"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
+	"orchestrator/examples"
+	"orchestrator/fixtures"
+	"orchestrator/internal/auth"
 	"orchestrator/internal/domain"
 	"orchestrator/internal/engine"
 	"orchestrator/internal/github"
 	"orchestrator/internal/repos"
+	"orchestrator/internal/sandbox"
 	"orchestrator/internal/store"
 )
 
@@ -37,6 +42,9 @@ type Server struct {
 	GitHub        *github.Client
 	WebhookSecret string
 	PublicURL     string // base URL for packet links in GitHub statuses
+	// ExampleRoot, when set, enables Local Pilot examples: fixture repos are
+	// materialised under it (must be outside the workspace root).
+	ExampleRoot string
 }
 
 func New(e *engine.Engine) *Server { return &Server{Engine: e} }
@@ -140,6 +148,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /tasks/{id}/effects", s.protect(auth.ActView, s.getEffects))
 	mux.HandleFunc("POST /tasks/{id}/github/post", s.protect(auth.ActPostExternal, s.githubPost))
 	mux.HandleFunc("GET /system", s.protect(auth.ActView, s.system))
+	mux.HandleFunc("GET /health", s.health)
+	mux.HandleFunc("GET /examples", s.protect(auth.ActView, s.listExamples))
+	mux.HandleFunc("POST /examples/{name}", s.protect(auth.ActCreate, s.runExample))
+	mux.HandleFunc("POST /tasks/{id}/cancel", s.protect(auth.ActCreate, s.cancelTask))
 	mux.HandleFunc("GET /repos", s.protect(auth.ActView, s.listRepos))
 	mux.HandleFunc("POST /repos", s.protect(auth.ActManageRepos, s.addRepo))
 	mux.HandleFunc("POST /github/import", s.protect(auth.ActCreate, s.githubImport))
@@ -148,6 +160,10 @@ func (s *Server) Handler() http.Handler {
 	// UI (static, embedded; carries no data).
 	mux.HandleFunc("GET /", s.ui)
 	mux.HandleFunc("GET /cases/{id}", s.ui)
+	mux.HandleFunc("GET /cases/{id}/{tab}", s.ui)
+	mux.HandleFunc("GET /new", s.ui)
+	mux.HandleFunc("GET /repos-ui", s.ui)
+	mux.HandleFunc("GET /help", s.ui)
 	return mux
 }
 
@@ -195,6 +211,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing {
+		if !p.Can(auth.ActView, s.scopeOf(t)) {
+			writeErr(w, store.ErrNotFound)
+			return
+		}
 		writeJSON(w, http.StatusOK, t) // replayed: no second run
 		return
 	}
@@ -206,10 +226,79 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) runAsync(id string) {
 	go func() {
-		if err := s.Engine.RunTask(context.Background(), id); err != nil && !errors.Is(err, engine.ErrAlreadyRunning) {
+		err := s.Engine.RunTask(context.Background(), id)
+		if errors.Is(err, context.Canceled) {
+			s.Engine.MarkInterrupted(id, "cancelled by user")
+			return
+		}
+		if err != nil && !errors.Is(err, engine.ErrAlreadyRunning) {
 			log.Printf("task %s: %v", id, err)
 		}
 	}()
+}
+
+func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.Engine.Cancel(id) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "task is not running in this process"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"task": id, "status": "cancelling"})
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "exec_mode": s.Engine.Policy.Mode})
+}
+
+// ---------- Local Pilot examples ----------
+
+func (s *Server) listExamples(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": s.ExampleRoot != "",
+		"note":      "Local Pilot examples run the REAL engine (worktree, baseline, go test, original-test replay, packet) on the embedded reservations fixture; only the agents' replies are scripted.",
+		"scenarios": examples.List(),
+	})
+}
+
+// runExample materialises a fresh fixture repository (outside the workspace
+// root, under ExampleRoot), registers it and starts a scenario case.
+func (s *Server) runExample(w http.ResponseWriter, r *http.Request) {
+	if s.ExampleRoot == "" || s.Engine.Repos == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Local Pilot examples are not enabled on this instance"})
+		return
+	}
+	name := r.PathValue("name")
+	_, meta, err := examples.Load(name)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	dir := filepath.Join(s.ExampleRoot, name+"-"+domain.NewID("fx")[3:], "reservations")
+	if err := fixtures.Materialize(dir); err != nil {
+		writeErr(w, err)
+		return
+	}
+	p := principalOf(r)
+	ws := s.requestedWorkspace(r, p)
+	if ws == LocalWorkspace {
+		ws = ""
+	}
+	rp, err := s.Engine.Repos.Add(dir, ws)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	t, err := s.Engine.CreateTaskSpec(engine.TaskSpec{
+		Goal: examples.Goal(meta), Repos: []string{rp.ID}, ReproCommand: examples.ReproCommand,
+		Kind: domain.KindBugfix, WorkspaceID: s.requestedWorkspace(r, p), Scenario: name,
+		Context: examples.Context(meta),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.runAsync(t.ID)
+	writeJSON(w, http.StatusCreated, t)
 }
 
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
@@ -385,7 +474,9 @@ func (s *Server) getVerdicts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ui(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && !strings.HasPrefix(r.URL.Path, "/cases/") {
+	switch {
+	case r.URL.Path == "/", r.URL.Path == "/new", r.URL.Path == "/repos-ui", r.URL.Path == "/help", strings.HasPrefix(r.URL.Path, "/cases/"):
+	default:
 		http.NotFound(w, r)
 		return
 	}
@@ -397,9 +488,18 @@ func (s *Server) ui(w http.ResponseWriter, r *http.Request) {
 // system reports the execution boundary so no client can assume safety.
 func (s *Server) system(w http.ResponseWriter, r *http.Request) {
 	p := s.Engine.Policy
+	execs := []string{}
+	for name := range s.Engine.Execs {
+		execs = append(execs, name)
+	}
+	sort.Strings(execs)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"exec_mode": p.Mode, "warning": p.Warning(), "capabilities": p.Capabilities(),
 		"workspace_root": p.WorkspaceRoot, "repos_roots": p.ReposRoots,
+		"github_connected": s.GitHub != nil && s.GitHub.Token != "", "webhook_configured": s.WebhookSecret != "",
+		"executors": execs, "examples_enabled": s.ExampleRoot != "",
+		"auth_configured":    s.Auth != nil && s.Auth.Configured(),
+		"integration_runner": "not configured",
 	})
 }
 
@@ -457,6 +557,12 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 			code = http.StatusUnauthorized
 		}
 		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.Engine.Policy.Mode != sandbox.ModeSafe && os.Getenv("PROOFLINE_ALLOW_UNSAFE_WEBHOOKS") == "" {
+		// A webhook runs code from whoever opened the PR. Without an OS
+		// sandbox that is host code execution for strangers.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "BLOCKED: webhook imports are refused in LOCAL_UNSAFE (run SAFE_SANDBOX, or set PROOFLINE_ALLOW_UNSAFE_WEBHOOKS=1 for trusted repositories only)", "delivery": d.ID})
 		return
 	}
 	t, existing, err := s.Engine.HandleDelivery(r.Context(), d)

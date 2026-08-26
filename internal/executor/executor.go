@@ -23,6 +23,8 @@ type Request struct {
 
 	// Attempt lets scripted executors vary responses across retries.
 	Attempt int
+	// Scenario selects a scripted reply set (Local Pilot examples).
+	Scenario string
 }
 
 // Result is the structured outcome of an agent invocation.

@@ -58,6 +58,8 @@ type Store interface {
 	ClaimIdempotencyKey(key, taskID string) (string, bool, error)
 
 	// External effects ledger (append-only; last record per key wins).
+	// WithEffectsLock serialises check-then-append across processes.
+	WithEffectsLock(taskID string, fn func() error) error
 	AddEffect(e domain.ExternalEffect) error
 	Effects(taskID string) ([]domain.ExternalEffect, error)
 

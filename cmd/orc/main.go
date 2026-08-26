@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 
+	"orchestrator/examples"
 	"orchestrator/internal/api"
 	"orchestrator/internal/auth"
 	"orchestrator/internal/domain"
@@ -200,7 +201,8 @@ func buildApp(dataDir, execName, scriptPath string) (*app, error) {
 	claude := executor.NewClaudeCLI()
 	claude.Policy = &pol
 	execs := map[string]executor.Executor{
-		"claude": claude,
+		"claude":   claude,
+		"scenario": &executor.ScenarioExecutor{Lookup: func(n string) (*executor.ScriptExecutor, error) { sc, _, err := examples.Load(n); return sc, err }},
 	}
 	if scriptPath != "" {
 		sc, err := executor.LoadScript(scriptPath)
@@ -337,6 +339,11 @@ func cmdServe(args []string) error {
 	srv.Auth = as
 	if !as.Configured() && !isLoopback(*addr) {
 		return fmt.Errorf("refusing to bind %s without authentication configured (run `orc auth init` or bind to 127.0.0.1)", *addr)
+	}
+	abs, _ := filepath.Abs(*dataDir)
+	srv.ExampleRoot = filepath.Join(filepath.Dir(abs), filepath.Base(abs)+"-examples")
+	if v := os.Getenv("PROOFLINE_EXAMPLES"); v == "off" {
+		srv.ExampleRoot = ""
 	}
 	srv.WebhookSecret = os.Getenv("PROOFLINE_GITHUB_WEBHOOK_SECRET")
 	srv.PublicURL = strings.TrimRight(os.Getenv("PROOFLINE_PUBLIC_URL"), "/")
