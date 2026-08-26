@@ -1,76 +1,70 @@
-# PRIVATE_BETA_READINESS — 2026-08-26
+# PRIVATE_BETA_READINESS — 2026-08-26 (final for this iteration)
 
-Question this answers: **can one throwaway repository go into a private
-beta on this build?** Short answer: **yes, on a trusted macOS machine in
-SAFE_SANDBOX, with Local Pilot or a manually imported PR; no for untrusted
-repositories or Linux hosting.** The project is not production-ready (see
-P0 blockers).
+Can one throwaway repository go into a private beta on this build?
+**Yes — on one trusted macOS host in SAFE_SANDBOX, Local Pilot or a
+manually imported PR, with the live-GitHub steps run per runbook first.
+No — for untrusted repositories, Linux hosting, or anything beyond one
+machine.** Not production-ready (P0 blockers at the end).
 
-| Capability | Status | Evidence |
-|---|---|---|
-| Build | **VERIFIED (macOS/Go 1.27 toolchain, go.mod pins 1.23)** / **BLOCKED (clean Linux image)** | `go build ./...`, `make verify` → `verify: OK` (build, vet, `go test ./...`, race subset, product acceptance). `Dockerfile` written; `docker build` NOT run — Docker daemon unavailable on this machine. |
-| Local Pilot product path | **VERIFIED** | `TestBrowserDecisionScreen` (headless Chrome DOM): empty overview → new-case form with honest not-configured states → real example run → BLOCKED packet with contradiction → human decision → reload shows pinned decision → history → 404 honesty. `TestExampleCaseEndToEndOverHTTP`, `TestCancelOverHTTPLeavesInterrupted`. Manual: three examples via UI, decision, **server restart**, state intact. |
-| Real agents through the web path | **VERIFIED once** | Registered repo + `POST /tasks` with Claude executor: SUPPORTED, 4/4 core claims, 9 gaps, $1.04 (task_24958557 in `.orchestrator`). |
-| Real GitHub path | **NOT VERIFIED (live)** / VERIFIED against fake server | `TestGitHubPRLifecycle`, `TestWebhookSignatureAndParsing`, `TestFetchPRAndRevocation` against `internal/github/fakegh`. No token here. Runbook: `REAL_GITHUB_PILOT.md`. |
-| Sandbox | **VERIFIED (macOS SAFE_SANDBOX)** / **PARTIALLY VERIFIED (agent)** / **BLOCKED (Linux/container)** | `TestSafeSandboxDeniesNetworkAndHostSecrets`, `TestSafeSandboxCanRunGoTests`, `TestCommandInjectionRejected`, `TestPathTraversalAndSymlinkEscape`, `TestBackgroundChildrenAreKilledOnTimeout`, `TestHostEnvironmentNotInherited`, `TestOutputCapAndRedaction`, `TestMaliciousHooksAndFsmonitorNeverRun`, engine `security_test.go`. Live Claude probe under the agent profile passed once (`PROOFLINE_LIVE=1`). Default mode is LOCAL_UNSAFE and is labelled on every screen, `/system`, packets and artifacts. |
-| Repository policy | **VERIFIED** | `TestIntegrationCheckEndToEnd` (commands come from policy; SAFE mode refuses ad-hoc commands — `TestSafeModeRefusesRawPathsAndOutsideRoots`). |
-| Integration check | **VERIFIED (HTTP provider)** | `TestIntegrationCheckEndToEnd`: service started from the worktree, 3 checks, fails on baseline / passes after fix → SUPPORTED bound to SHA; unfixed head → CONTRADICTED → BLOCKED. Example A in the UI shows it. Cross-service stays INSUFFICIENT by design. |
-| Auth/workspace | **PARTIALLY VERIFIED** | `internal/api/authz_test.go` (401/403/404 matrix, cross-tenant, revoked membership, header escalation); token entry + sign-out in the UI; `GET /whoami`; audit log (`GET /audit`, UI page). Not verified: token rotation UX, non-loopback deployment. |
-| Recovery/cancel | **VERIFIED** | `lifecycle_test.go` (crash during research/implementation/tests, packet rebuild, stale lease), `concurrency_test.go` (CAS, idempotency, two workers, verdict pinning, cancel kills children, packet version serialisation), `TestReverifyAfterEditProducesFreshEvidence`. |
-| Production deploy | **NOT VERIFIED** | Never deployed. Blockers: Docker build unverified; no Linux execution boundary; no TLS/reverse-proxy story; file store only. |
+| Capability | Status | Evidence | Remaining risk |
+|---|---|---|---|
+| Build | **VERIFIED** (local) / **NOT VERIFIED** (CI, Docker) | `make verify` → `verify: OK`; `go.mod` pins 1.23; BUILD_READINESS.md; `.github/workflows/verify.yml` and `Dockerfile` never executed here (no Docker daemon, CI not run) | clean-Linux build unproven |
+| Product UI | **VERIFIED** | `TestBrowserDecisionScreen` (headless Chrome DOM: empty state, form honesty, packet, timeline, decision + reload, history, 404); screenshots reviewed | polling (2 s), no SSE; no diff viewer |
+| Local Pilot | **VERIFIED** | `TestAcceptanceScenariosOverHTTP`: A supported (+integration supported), B/C/E blocked, stale after edit → re-verify → supported v≥3, cancel → interrupted → resume → done; `TestExampleCaseEndToEndOverHTTP`; manual server restart | scripted agents in examples (labelled) |
+| Real agents via web path | **VERIFIED once** | task_24958557: registered repo → `POST /tasks` → Claude sonnet/opus → SUPPORTED, 9 gaps, $1.04 | cost; reviewer coverage self-reported |
+| GitHub fake path | **VERIFIED** | `TestGitHubPRLifecycle` (A verified → B pushed → one case per head, A immutable, NOT VERIFIED for B, duplicate deliveries, revocation → BLOCKED, effects ledger refuses replay), `TestWebhookSignatureAndParsing`, `TestFetchPRAndRevocation` | — |
+| GitHub live path | **NOT VERIFIED** | no token; runbook `REAL_GITHUB_PILOT.md`; UI shows "not connected"; posting button disabled | one shared webhook secret; PR listing not implemented |
+| Repository policy | **VERIFIED** | `TestIntegrationCheckEndToEnd` (commands from policy), `TestRepositoryPolicyEnforcedOverHTTP` (allowed_runners, agent_write=false → verify-only, hostile policy rejected), `TestSafeModeRefusesRawPathsAndOutsideRoots` | retention_days informational only (`orc gc` is manual) |
+| Integration check | **VERIFIED** (HTTP provider) | `TestIntegrationCheckEndToEnd`: service started from worktree, 3 checks; baseline fail → after pass → SUPPORTED bound to SHA; unfixed head → CONTRADICTED; unavailable/timeout → INSUFFICIENT (code path; unit-level via outcome field) | one provider (HTTP); no compose/datastore; cross-service INSUFFICIENT by design |
+| Auth/workspace | **VERIFIED** (API) / **PARTIALLY VERIFIED** (UX) | `authz_test.go` (401/403/404, cross-tenant, revoked, header escalation), `TestTokenIssueRevokeAndWorkspaces` (issue/list/revoke, members, owner-only); UI sign-in, workspace switcher, tokens, members | first-user setup is CLI (`orc auth init`); no SSO; tokens in browser localStorage |
+| Sandbox | **VERIFIED** (macOS SAFE_SANDBOX) / **PARTIALLY VERIFIED** (agent) / **BLOCKED** (Linux) | sandbox adversarial tests, engine security tests, gitws hooks test, live Claude probe (once); default LOCAL_UNSAFE labelled everywhere | default is unsafe; agent keychain access; Linux none |
+| Recovery/cancel | **VERIFIED** | lifecycle, concurrency, `TestCancelOverHTTPLeavesInterrupted`, acceptance interrupted→resumed; graceful shutdown implemented (`Engine.Shutdown`) — **NOT VERIFIED** by test | shutdown untested |
+| Evidence integrity | **VERIFIED** | EVIDENCE_INVARIANTS.md I1–I13 ↔ tests; FALSE_PROOF_REPORT.md; scenario matrix | semantic fake fix; self-reported reviewer coverage; Go/pytest test identity only |
+| Operations/deployment | **PARTIALLY VERIFIED** | `/health`, `/ready` (writability probe), `/metrics` (derived from persisted state), request logs with `X-Request-ID`, failure taxonomy (`failure_kind`), `orc backup/restore` (`TestBackupRestoreRoundTrip`), `orc gc` | never deployed; no TLS; file store; no alerts |
 
-## Files changed (this step)
-`go.mod` (go 1.23), `Dockerfile`, `Makefile` (verify), `README.md`,
-`fixtures/embed.go` + `fixtures/reservations/cmd/server/main.go.fixture`,
-`internal/repos` (Policy, IntegrationCheck, SetPolicy), `internal/sandbox/proc.go`
-(+ LocalNetwork profile), `internal/integration/`, `internal/engine`
-(policy application, integration runs, reverify, audit), `internal/proof`
-(integration claim), `internal/domain` (AuditRecord, integration artifact),
-`internal/store` (audit), `internal/api` (policy/audit/whoami endpoints,
-GitHub post button, UI), `cmd/orc` (repo policy, gc), tests, `REAL_GITHUB_PILOT.md`.
+## Files changed (this iteration)
+`.github/workflows/verify.yml`, `Makefile`, `Dockerfile`, `go.mod`, `README.md`,
+`internal/repos` (policy fields/enforcement), `internal/integration` (outcomes),
+`internal/proof` (integration INSUFFICIENT on unavailable/timeout),
+`internal/engine` (policy enforcement, Shutdown, failure taxonomy),
+`internal/auth` (tokens/members listing), `internal/api` (tokens, workspaces,
+members, ready, metrics, Logged), `internal/api/ui.html` (workspace/tokens),
+`cmd/orc` (graceful shutdown, backup, restore), tests: `acceptance_test.go`,
+`tokens_test.go`; docs: BUILD_READINESS.md, PILOT_RUNBOOK.md, this file.
 
 ## Commands run
-`go vet ./...`, `go test ./...` (all ok), `go test -race` subset (ok),
-`make verify` (OK), headless-Chrome screenshots of overview / packet /
-timeline / new-case, manual server restart check.
+`gofmt -l .`, `go vet ./...`, `go build -o bin/orc ./cmd/orc`, `go test ./...`,
+`go test -race` (subset via `make verify`; full race run earlier today green),
+`make verify` → `verify: OK`, headless Chrome screenshots, manual restart.
 
 ## Real vs scripted
-- Real everywhere: worktrees, baseline/test/integration commands, commits,
-  SHAs, artifacts, packets, verdicts, audit, cancel/resume, Claude agents
-  when the `claude` CLI is used.
-- Scripted: only the agents' replies in "Local Pilot example" cases
-  (executor `scenario`), labelled on the case, overview and runs table.
-- Fake: nothing. The fake GitHub server exists only in tests.
+Real: worktrees, baseline/test/integration/replay commands, commits, SHAs,
+artifacts, packets, verdicts, audit, cancel/resume/reverify, Claude agents
+when used. Scripted: agent replies in "Local Pilot example" cases only
+(labelled). Fake: nothing; `fakegh` exists only in tests.
+
+## Target OS / execution mode
+macOS, `SAFE_SANDBOX` for the pilot; `LOCAL_UNSAFE` default for development.
+Linux: build only.
+
+## External services / credentials used
+Anthropic via the local `claude` CLI (one real run). No GitHub credentials.
 
 ## Remaining unsafe paths
-1. LOCAL_UNSAFE default: commands and agents reach the host. Loud, but a
-   default.
-2. SAFE_SANDBOX is macOS-only; the agent profile allows the login keychain
-   (CLI auth) and network.
-3. Developer agent may run `go test`/`go build` etc. on repository code —
-   arbitrary code by construction; only the OS sandbox bounds it.
-4. Redaction is pattern-based.
-5. One webhook secret for all workspaces; webhooks refused in LOCAL_UNSAFE
-   unless explicitly allowed.
-6. Integration services listen on localhost with a policy-chosen port; two
-   concurrent cases with the same port collide (example policy randomises).
+1. LOCAL_UNSAFE default (loud). 2. Linux has no boundary. 3. Agent under
+SAFE_SANDBOX can read the login keychain and has network. 4. Regex redaction.
+5. Single webhook secret; webhooks refused in LOCAL_UNSAFE by default.
+6. Integration service port collisions between concurrent cases with the same policy port.
 
-## First-pilot runbook (trusted macOS host, one throwaway repo)
-```bash
-make build
-export PROOFLINE_SANDBOX=SAFE_SANDBOX
-export PROOFLINE_REPOS_ROOT=$HOME/pilot-repos
-./bin/orc auth init --workspace pilot --user you        # prints the token once
-./bin/orc repo add $HOME/pilot-repos/REPO [--github owner/REPO]
-./bin/orc repo policy <repo_id> --file policy.json      # approved test/repro (+ optional HTTP check)
-./bin/orc serve --addr 127.0.0.1:8080 --data ./.orchestrator
-# open http://127.0.0.1:8080 → paste token → New change case → Start verification
-```
-GitHub posting: follow `REAL_GITHUB_PILOT.md` and mark the row VERIFIED only
-after the six steps pass.
+## NOT VERIFIED
+CI workflow run, Docker build, GitHub live path, graceful shutdown under load, non-loopback deployment.
 
-## P0 blockers before anything beyond one trusted machine
-1. Linux/container execution boundary (BLOCKED here: no Docker daemon).
-2. Live GitHub run with a real token (NOT VERIFIED).
-3. Verified clean-environment build (`docker build`) — BLOCKED here.
-4. TLS / reverse proxy and token delivery for a non-loopback bind.
+## P0 blockers before production
+1. Linux/container execution boundary. 2. Live GitHub verification.
+3. Verified clean-environment build (CI/Docker). 4. TLS/reverse proxy and
+token delivery for non-loopback. 5. Graceful shutdown test.
+
+## Recommended next step
+Run `REAL_GITHUB_PILOT.md` with a throwaway repo and a scoped token; then
+push the CI workflow and fix whatever the clean Linux build reveals. Only
+after both: decide on the Linux boundary (bwrap vs container).

@@ -171,6 +171,11 @@ func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /whoami", s.protect(auth.ActView, s.whoami))
+	mux.HandleFunc("GET /auth/tokens", s.protect(auth.ActView, s.listTokens))
+	mux.HandleFunc("POST /auth/tokens", s.protect(auth.ActView, s.issueToken))
+	mux.HandleFunc("DELETE /auth/tokens/{tid}", s.protect(auth.ActView, s.revokeToken))
+	mux.HandleFunc("GET /workspaces", s.protect(auth.ActView, s.listWorkspaces))
+	mux.HandleFunc("POST /workspaces/{wid}/members", s.protect(auth.ActManageMembers, s.addMember))
 	mux.HandleFunc("GET /audit", s.protect(auth.ActView, s.getAudit))
 	mux.HandleFunc("POST /tasks", s.protect(auth.ActCreate, s.createTask))
 	mux.HandleFunc("GET /tasks", s.protect(auth.ActView, s.listTasks))
@@ -188,6 +193,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /tasks/{id}/github/post", s.protect(auth.ActPostExternal, s.githubPost))
 	mux.HandleFunc("GET /system", s.protect(auth.ActView, s.system))
 	mux.HandleFunc("GET /health", s.health)
+	mux.HandleFunc("GET /ready", s.ready)
+	mux.HandleFunc("GET /metrics", s.protect(auth.ActView, s.metrics))
 	mux.HandleFunc("GET /examples", s.protect(auth.ActView, s.listExamples))
 	mux.HandleFunc("POST /examples/{name}", s.protect(auth.ActCreate, s.runExample))
 	mux.HandleFunc("POST /tasks/{id}/cancel", s.protect(auth.ActCreate, s.cancelTask))
@@ -289,6 +296,82 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "case.cancel", "", id, "")
 	writeJSON(w, http.StatusAccepted, map[string]string{"task": id, "status": "cancelling"})
 }
+
+// ready fails when the data dir or workspace root is not writable, so a
+// deployment does not receive traffic it cannot persist.
+func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	probe := filepath.Join(s.Engine.Policy.WorkspaceRoot, ".ready-probe")
+	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "error": err.Error()})
+		return
+	}
+	_ = os.Remove(probe)
+	if _, err := s.Engine.Store.ListTasks(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ready": true})
+}
+
+// metrics: counters derived from persisted state (no in-memory drift).
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
+	tasks, _ := s.Engine.Store.ListTasks()
+	p := principalOf(r)
+	byStatus, byVerdict, byKind := map[string]int{}, map[string]int{}, map[string]int{}
+	var cost float64
+	var dur int64
+	runs, attempts := 0, 0
+	for _, t := range tasks {
+		if !p.Can(auth.ActView, s.scopeOf(t)) {
+			continue
+		}
+		byStatus[string(t.Status)]++
+		if t.FailureKind != "" {
+			byKind[t.FailureKind]++
+		}
+		attempts += t.State.ImplementAttempts
+		if ps, err := s.Engine.Store.Packets(t.ID); err == nil && len(ps) > 0 {
+			byVerdict[string(ps[len(ps)-1].Verdict)]++
+		}
+		if rs, err := s.Engine.Store.Runs(t.ID); err == nil {
+			for _, x := range rs {
+				runs++
+				cost += x.CostUSD
+				dur += x.DurationMS
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tasks_by_status": byStatus, "packets_by_verdict": byVerdict, "failures_by_kind": byKind,
+		"agent_runs": runs, "implement_attempts": attempts, "cost_usd": cost, "agent_duration_ms": dur,
+		"exec_mode": s.Engine.Policy.Mode,
+	})
+}
+
+// Logged wraps the handler with a correlation id (X-Request-ID, generated
+// when absent) and one structured JSON log line per request. Never logs
+// headers or bodies (tokens).
+func Logged(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-ID")
+		if rid == "" {
+			rid = domain.NewID("req")
+		}
+		w.Header().Set("X-Request-ID", rid)
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, code: 200}
+		h.ServeHTTP(sw, r)
+		b, _ := json.Marshal(map[string]any{"ts": start.UTC().Format(time.RFC3339Nano), "rid": rid, "method": r.Method, "path": r.URL.Path, "status": sw.code, "ms": time.Since(start).Milliseconds()})
+		log.Println(string(b))
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusWriter) WriteHeader(c int) { s.code = c; s.ResponseWriter.WriteHeader(c) }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "exec_mode": s.Engine.Policy.Mode})
@@ -764,4 +847,119 @@ func examplePolicy() *repos.Policy {
 			},
 		},
 	}
+}
+
+// ---------- tokens & workspaces (private-beta auth UX) ----------
+
+func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil || !s.Auth.Configured() {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	toks := s.Auth.TokensOf(principalOf(r).UserID)
+	if toks == nil {
+		toks = []auth.Token{}
+	}
+	writeJSON(w, http.StatusOK, toks)
+}
+
+// issueToken issues a new token for the caller (rotation) and returns the
+// secret exactly once; it is never stored in clear or logged.
+func (s *Server) issueToken(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil || !s.Auth.Configured() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "local mode: no tokens (run orc auth init)"})
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req)
+	secret, err := s.Auth.IssueToken(principalOf(r).UserID, req.Name)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.audit(r, "token.issue", "", principalOf(r).UserID, req.Name)
+	writeJSON(w, http.StatusCreated, map[string]string{"token": secret, "note": "shown once"})
+}
+
+func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil || !s.Auth.Configured() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "local mode"})
+		return
+	}
+	id := r.PathValue("tid")
+	mine := false
+	for _, t := range s.Auth.TokensOf(principalOf(r).UserID) {
+		if t.ID == id {
+			mine = true
+		}
+	}
+	if !mine {
+		writeErr(w, store.ErrNotFound)
+		return
+	}
+	if err := s.Auth.RevokeToken(id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.audit(r, "token.revoke", "", principalOf(r).UserID, id)
+	writeJSON(w, http.StatusOK, map[string]string{"revoked": id})
+}
+
+func (s *Server) listWorkspaces(w http.ResponseWriter, r *http.Request) {
+	p := principalOf(r)
+	out := []map[string]any{}
+	if s.Auth == nil || !s.Auth.Configured() {
+		out = append(out, map[string]any{"id": LocalWorkspace, "name": "local (single-user mode)", "role": auth.RoleOwner})
+	} else {
+		for _, ws := range s.Auth.Workspaces() {
+			if role, ok := p.Roles[ws.ID]; ok {
+				var members any
+				if p.Can(auth.ActManageMembers, ws.ID) {
+					members = s.Auth.Members(ws.ID)
+				}
+				out = append(out, map[string]any{"id": ws.ID, "name": ws.Name, "role": role, "members": members})
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// addMember creates a user in the workspace and returns their first token
+// once (owner only, via the matrix).
+func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
+	if s.Auth == nil || !s.Auth.Configured() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "local mode"})
+		return
+	}
+	wid := r.PathValue("wid")
+	if !principalOf(r).Can(auth.ActManageMembers, wid) {
+		writeErr(w, store.ErrNotFound)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil || req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and role required"})
+		return
+	}
+	u, err := s.Auth.CreateUser(req.Name)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.Auth.SetMembership(u.ID, wid, auth.Role(req.Role)); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	tok, err := s.Auth.IssueToken(u.ID, "initial")
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.audit(r, "member.add", wid, u.ID, req.Role)
+	writeJSON(w, http.StatusCreated, map[string]any{"user_id": u.ID, "role": req.Role, "token": tok, "note": "shown once"})
 }

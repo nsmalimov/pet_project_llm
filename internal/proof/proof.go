@@ -705,6 +705,15 @@ func (b *builder) claimIntegration() domain.Claim {
 	}
 	c.ArtifactIDs = ids(b.integ)
 	for _, a := range b.integ {
+		if a.Summary == "unavailable" || a.Summary == "timeout" || a.TimedOut {
+			// The service could not be exercised: nothing was observed, so
+			// nothing is contradicted — but nothing is supported either.
+			c.Status = domain.ClaimInsufficient
+			c.Statement = "The integration check could not run: " + a.Summary + "."
+			c.Reason = "integration_run artifact with outcome " + a.Summary + " (service unavailable or timed out)"
+			c.Gap = "a run in which the service starts and the checks execute"
+			return c
+		}
 		if a.Passed == nil || !*a.Passed {
 			c.Status = domain.ClaimContradicted
 			failed := testsWith(a.Tests, "fail")

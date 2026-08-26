@@ -297,6 +297,31 @@ func (e *Engine) RunTask(ctx context.Context, id string) error {
 	}
 }
 
+// Shutdown cancels every running task in this process and marks each one
+// interrupted with a resume point (graceful stop; nothing becomes done).
+func (e *Engine) Shutdown() {
+	e.mu.Lock()
+	ids := make([]string, 0, len(e.cancels))
+	for id, c := range e.cancels {
+		ids = append(ids, id)
+		c()
+	}
+	e.mu.Unlock()
+	deadline := time.Now().Add(15 * time.Second)
+	for _, id := range ids {
+		for time.Now().Before(deadline) {
+			e.mu.Lock()
+			_, running := e.running[id]
+			e.mu.Unlock()
+			if !running {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		e.MarkInterrupted(id, "server shutdown")
+	}
+}
+
 // Cancel stops a running task: the step's context is cancelled (child
 // process groups are killed by the sandbox), and once the loop has exited
 // the task is marked interrupted with a resume point. Returns false if the
@@ -336,9 +361,34 @@ func (e *Engine) MarkInterrupted(id, reason string) {
 	_, _ = e.snapshotPacket(t)
 }
 
+// classify maps an error/reason to the failure taxonomy.
+func classify(reason string) string {
+	r := strings.ToLower(reason)
+	switch {
+	case strings.Contains(r, "policy") || strings.Contains(r, "symlink") || strings.Contains(r, "escape"):
+		return "sandbox_violation"
+	case strings.Contains(r, "revoked") || strings.Contains(r, "not visible"):
+		return "revoked_access"
+	case strings.Contains(r, "aborted by human") || strings.Contains(r, "cancel"):
+		return "user_cancelled"
+	case strings.Contains(r, "timed out") || strings.Contains(r, "timeout") || strings.Contains(r, "deadline"):
+		return "timeout"
+	case strings.Contains(r, "unparseable") || strings.Contains(r, "does not match schema") || strings.Contains(r, "no json"):
+		return "malformed_output"
+	case strings.Contains(r, "tests keep failing") || strings.Contains(r, "test"):
+		return "test_failure"
+	case strings.Contains(r, "budget"):
+		return "budget_exceeded"
+	case strings.Contains(r, "claude cli") || strings.Contains(r, "executor"):
+		return "provider_error"
+	}
+	return "unknown"
+}
+
 func (e *Engine) failTask(t *domain.Task, reason string) error {
 	t.Status = domain.StatusFailed
 	t.FailureReason = reason
+	t.FailureKind = classify(reason)
 	if err := e.Store.SaveTask(t); err != nil {
 		return err
 	}
@@ -444,6 +494,7 @@ func (e *Engine) requireDecision(t *domain.Task, dr *domain.DecisionRequest, ret
 	if d.Importance == "" {
 		d.Importance = "medium"
 	}
+	t.FailureKind = classify(dr.Reason + " " + dr.Question)
 	if len(d.Options) == 0 {
 		d.Options = []domain.DecisionOption{
 			{ID: "proceed", Label: "Proceed with the recommendation"},

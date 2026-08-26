@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"orchestrator/internal/auth"
 	"orchestrator/internal/domain"
@@ -215,6 +216,15 @@ func TestRoleMatrixWithinWorkspace(t *testing.T) {
 	// Member of A finally resolves; the same call by B stays 404.
 	if code, body := h.do(t, "A.member", "POST", "/tasks/"+h.taskA+"/decisions/"+ds[0].ID+"/resolve", map[string]any{"option": "a"}); code != 200 {
 		t.Fatalf("A.member resolve → %d %s", code, body)
+	}
+	// The resolve restarts the engine asynchronously; let it settle before
+	// the temp dir is removed.
+	for i := 0; i < 300; i++ {
+		tk, _ := h.eng.Store.GetTask(h.taskA)
+		if tk != nil && !tk.Status.Active() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

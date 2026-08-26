@@ -187,8 +187,12 @@ type Task struct {
 	Scenario      string     `json:"scenario,omitempty"`
 	Status        TaskStatus `json:"status"`
 	FailureReason string     `json:"failure_reason,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	// FailureKind classifies terminal/paused failures: provider_error |
+	// timeout | malformed_output | sandbox_violation | test_failure |
+	// revoked_access | user_cancelled | budget_exceeded | unknown_external_effect
+	FailureKind string    `json:"failure_kind,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 	// Version is the optimistic-concurrency counter of the snapshot. Every
 	// SaveTask must present the version it read; a mismatch is a conflict.
 	Version int       `json:"version"`

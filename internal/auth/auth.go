@@ -84,7 +84,7 @@ type Membership struct {
 
 type Token struct {
 	ID        string     `json:"id"`
-	Hash      string     `json:"hash"` // sha256 of the secret; the secret is shown once
+	Hash      string     `json:"hash,omitempty"` // sha256 of the secret; the secret is shown once
 	UserID    string     `json:"user_id"`
 	Name      string     `json:"name"`
 	CreatedAt time.Time  `json:"created_at"`
@@ -232,6 +232,37 @@ func (s *Store) IssueToken(userID, name string) (string, error) {
 	defer s.mu.Unlock()
 	s.st.Tokens = append(s.st.Tokens, Token{ID: newID("tok"), Hash: hex.EncodeToString(h[:]), UserID: userID, Name: name, CreatedAt: time.Now().UTC()})
 	return secret, s.save()
+}
+
+// TokensOf lists a user's tokens (hashes are never returned).
+func (s *Store) TokensOf(userID string) []Token {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Token
+	for _, t := range s.st.Tokens {
+		if t.UserID == userID {
+			t.Hash = ""
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// Members lists memberships of a workspace with user names.
+func (s *Store) Members(workspaceID string) []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	names := map[string]string{}
+	for _, u := range s.st.Users {
+		names[u.ID] = u.Name
+	}
+	var out []map[string]any
+	for _, m := range s.st.Memberships {
+		if m.WorkspaceID == workspaceID {
+			out = append(out, map[string]any{"user_id": m.UserID, "name": names[m.UserID], "role": m.Role, "revoked": m.RevokedAt != nil})
+		}
+	}
+	return out
 }
 
 func (s *Store) RevokeToken(id string) error {

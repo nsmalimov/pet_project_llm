@@ -95,6 +95,17 @@ fails → after passes → SUPPORTED), re-verify, audit log, token UI, GitHub
 post from the packet, `make verify`, `Dockerfile` (build not verified —
 no Docker daemon), `orc gc`. Readiness table: PRIVATE_BETA_READINESS.md.
 
+## Master-prompt pass (2026-08-26, night)
+CI workflow + gofmt check + BUILD_READINESS.md; policy fields (allowed
+runners, agent_write, scope, retention) enforced; integration outcomes
+pass/fail/unavailable/timeout (unavailable/timeout → INSUFFICIENT, not
+CONTRADICTED); token issue/revoke + members + workspace switcher (API + UI);
+graceful shutdown, `/ready`, `/metrics`, request-ID logs, failure taxonomy,
+`orc backup/restore`; HTTP acceptance test over every scenario incl. stale →
+re-verify and interrupted → resumed; PILOT_RUNBOOK.md; final
+PRIVATE_BETA_READINESS.md. Still NOT VERIFIED: CI run, Docker build, live
+GitHub, shutdown under load. BLOCKED: Linux boundary.
+
 ## What is fake / stub / thin
 
 - **The router is 40 lines of if-else.** Deliberate: the *interface* carries

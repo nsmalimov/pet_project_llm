@@ -25,6 +25,9 @@ type Result struct {
 	Output   string // check log + service output tail (redacted)
 	Redacted int
 	Err      string // runner-level problem (could not start, port never opened)
+	// Outcome: pass | fail | unavailable (service never came up / rejected
+	// start command) | timeout (cancelled or a check timed out).
+	Outcome string
 }
 
 // Run executes chk against the service started in dir.
@@ -34,14 +37,14 @@ func Run(ctx context.Context, pol sandbox.Policy, dir string, chk *repos.Integra
 	argv, err := pol.ValidateCommand(chk.Start)
 	if err != nil {
 		res.Err = "start command rejected: " + err.Error()
-		res.Output = res.Err
+		res.Output, res.Outcome = res.Err, "unavailable"
 		return res
 	}
 	port := chk.Port
 	proc, err := pol.Start(ctx, sandbox.Spec{Dir: dir, Argv: argv, LocalNetwork: true, ExtraEnv: []string{"PORT=" + strconv.Itoa(port)}})
 	if err != nil {
 		res.Err = "could not start service: " + err.Error()
-		res.Output = res.Err
+		res.Output, res.Outcome = res.Err, "unavailable"
 		return res
 	}
 	defer func() {
@@ -68,13 +71,14 @@ func Run(ctx context.Context, pol sandbox.Policy, dir string, chk *repos.Integra
 		}
 		select {
 		case <-ctx.Done():
-			res.Err = "cancelled"
+			res.Err, res.Outcome = "cancelled", "timeout"
 			return res
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
 	if !up {
 		res.Err = fmt.Sprintf("service did not listen on %s within %s", addr, startup)
+		res.Outcome = "unavailable"
 		fmt.Fprintln(&log, res.Err)
 		return res
 	}
@@ -100,6 +104,9 @@ func Run(ctx context.Context, pol sandbox.Policy, dir string, chk *repos.Integra
 		if err != nil {
 			res.Checks = append(res.Checks, domain.TestCase{Name: c.Name, Status: "fail"})
 			res.Passed = false
+			if ctx.Err() != nil || strings.Contains(err.Error(), "Timeout") || strings.Contains(err.Error(), "deadline") {
+				res.Outcome = "timeout"
+			}
 			fmt.Fprintf(&log, "[FAIL] %s: %s %s → %v\n", c.Name, method, c.Path, err)
 			continue
 		}
@@ -115,6 +122,13 @@ func Run(ctx context.Context, pol sandbox.Policy, dir string, chk *repos.Integra
 		}
 		res.Checks = append(res.Checks, domain.TestCase{Name: c.Name, Status: st})
 		fmt.Fprintf(&log, "[%s] %s: %s %s %s → %d (expected %d%s) body: %s\n", strings.ToUpper(st), c.Name, method, c.Path, c.Body, resp.StatusCode, c.ExpectStatus, expectBody(c), tail(bodyText, 300))
+	}
+	if res.Outcome == "" {
+		if res.Passed {
+			res.Outcome = "pass"
+		} else {
+			res.Outcome = "fail"
+		}
 	}
 	return res
 }

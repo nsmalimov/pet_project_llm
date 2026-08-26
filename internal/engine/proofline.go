@@ -128,6 +128,16 @@ func (e *Engine) CreateTaskSpec(spec TaskSpec) (*domain.Task, error) {
 			} else if e.Policy.Mode == sandbox.ModeSafe && (spec.TestCommand != "" || spec.ReproCommand != "") {
 				return nil, fmt.Errorf("SAFE_SANDBOX: repository %s has no policy; ad-hoc commands are refused", ref)
 			}
+			if rp.Policy != nil {
+				for _, c := range []string{spec.TestCommand, spec.ReproCommand} {
+					if c != "" && !rp.Policy.RunnerAllowed(c) {
+						return nil, fmt.Errorf("repository policy of %s does not allow runner of %q", ref, c)
+					}
+				}
+				if !rp.Policy.AgentMayWrite() && spec.HeadRef == "" {
+					return nil, fmt.Errorf("repository %s is verify-only by policy (agent_write=false): provide an existing head ref", ref)
+				}
+			}
 		}
 	}
 	t, err := e.createTask(spec.Goal, spec.Context, spec.Repos, spec.TestCommand, spec.forcedID)
@@ -294,6 +304,8 @@ func (e *Engine) runIntegration(ctx context.Context, t *domain.Task, title strin
 		if res.Err != "" {
 			a.ExitCode = -1
 		}
+		a.TimedOut = res.Outcome == "timeout"
+		a.Summary = res.Outcome // pass | fail | unavailable | timeout
 		e.bindSource(ctx, t, &a, heads, dirty)
 		a = e.addArtifact(t, a)
 		out = append(out, a)

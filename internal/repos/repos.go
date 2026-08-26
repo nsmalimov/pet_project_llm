@@ -37,6 +37,39 @@ type Policy struct {
 	ReproCommand  string            `json:"repro_command,omitempty"`
 	Integration   *IntegrationCheck `json:"integration,omitempty"`
 	MaxWorktreeMB int               `json:"max_worktree_mb,omitempty"`
+	// AllowedRunners narrows the instance runner allowlist for this repo
+	// (empty = instance default).
+	AllowedRunners []string `json:"allowed_runners,omitempty"`
+	// AgentWrite=false makes the repository verify-only: no developer agent
+	// may edit it; only existing heads are verified.
+	AgentWrite *bool `json:"agent_write,omitempty"`
+	// Scope lists what verification covers (informational, shown on the
+	// case): e.g. ["tests","integration","independent_challenge"].
+	Scope []string `json:"scope,omitempty"`
+	// RetentionDays: worktrees of finished cases may be reclaimed after this.
+	RetentionDays int `json:"retention_days,omitempty"`
+}
+
+// AgentMayWrite reports whether a developer agent may edit this repository.
+func (p *Policy) AgentMayWrite() bool {
+	return p == nil || p.AgentWrite == nil || *p.AgentWrite
+}
+
+// RunnerAllowed checks argv[0] against the repository's narrowed allowlist.
+func (p *Policy) RunnerAllowed(cmd string) bool {
+	if p == nil || len(p.AllowedRunners) == 0 {
+		return true
+	}
+	f := strings.Fields(cmd)
+	if len(f) == 0 {
+		return false
+	}
+	for _, r := range p.AllowedRunners {
+		if f[0] == r {
+			return true
+		}
+	}
+	return false
 }
 
 // IntegrationCheck starts the service from the worktree and probes it.

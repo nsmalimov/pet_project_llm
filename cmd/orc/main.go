@@ -3,11 +3,13 @@
 package main
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -70,6 +72,10 @@ func main() {
 		err = cmdAuth(os.Args[2:])
 	case "gc":
 		err = cmdGC(os.Args[2:])
+	case "backup":
+		err = cmdBackup(os.Args[2:])
+	case "restore":
+		err = cmdRestore(os.Args[2:])
 	case "memory":
 		err = cmdMemory(os.Args[2:])
 	case "-h", "--help", "help":
@@ -119,6 +125,8 @@ Usage:
   orc auth    add-user --workspace <ws-id> --user <name> --role owner|admin|member|reviewer|viewer
   orc auth    revoke --workspace <ws-id> --user <user-id>
   orc gc      [--older 7d] [--dry-run]   remove worktrees of finished/failed cases (evidence stays)
+  orc backup  <archive.tar>            archive task state, packets, artifacts, repos, auth (no worktrees)
+  orc restore <archive.tar> --data <empty-dir>   restore an archive into a fresh data dir
   orc memory  add --kind <preference|project_rule|correction> [--scope name] "<text>"
   orc memory  list
 
@@ -357,7 +365,21 @@ func cmdServe(args []string) error {
 		srv.GitHub = &github.Client{Token: tok, BaseURL: os.Getenv("PROOFLINE_GITHUB_API")}
 	}
 	fmt.Printf("orchestrator API on %s (data: %s, sandbox: %s, github: %v)\n", *addr, *dataDir, a.eng.Policy.Mode, srv.GitHub != nil)
-	return http.ListenAndServe(*addr, srv.Handler())
+	hs := &http.Server{Addr: *addr, Handler: api.Logged(srv.Handler()), ReadHeaderTimeout: 10 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errCh := make(chan error, 1)
+	go func() { errCh <- hs.ListenAndServe() }()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+	fmt.Fprintln(os.Stderr, "shutdown: stopping running cases (they resume later), draining HTTP")
+	a.eng.Shutdown()
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return hs.Shutdown(sctx)
 }
 
 func openApp(fs *flag.FlagSet, args []string) (*app, []string, error) {
@@ -946,5 +968,124 @@ func cmdGC(args []string) error {
 		n++
 	}
 	fmt.Printf("%d worktree(s) reclaimed\n", n)
+	return nil
+}
+
+// cmdBackup archives everything needed to reopen every case and verdict:
+// tasks (state, events, runs, artifacts, packets, verdicts, effects),
+// repos.json, auth.json, idempotency.json, audit.jsonl. Worktrees are not
+// included: they are derived and can be re-created (or are stale anyway).
+func cmdBackup(args []string) error {
+	fs := flag.NewFlagSet("backup", flag.ExitOnError)
+	dataDir := fs.String("data", ".orchestrator", "data directory")
+	if err := fs.Parse(reorderArgs(args)); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: orc backup <archive.tar>")
+	}
+	out, err := os.Create(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	tw := tar.NewWriter(out)
+	defer tw.Close()
+	root, _ := filepath.Abs(*dataDir)
+	n := 0
+	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, p)
+		if rel == "." {
+			return nil
+		}
+		top := strings.SplitN(rel, string(filepath.Separator), 2)[0]
+		if top == "worktrees" || top == "home" || top == "tmp" || top == "cache" {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") { // lock files
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(tw, f)
+		f.Close()
+		n++
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("backed up %d file(s) from %s to %s\n", n, root, fs.Arg(0))
+	return nil
+}
+
+func cmdRestore(args []string) error {
+	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+	dataDir := fs.String("data", "", "empty target data directory")
+	if err := fs.Parse(reorderArgs(args)); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 || *dataDir == "" {
+		return errors.New("usage: orc restore <archive.tar> --data <empty-dir>")
+	}
+	root, _ := filepath.Abs(*dataDir)
+	if entries, err := os.ReadDir(root); err == nil && len(entries) > 0 {
+		return fmt.Errorf("refusing to restore into non-empty %s", root)
+	}
+	in, err := os.Open(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tr := tar.NewReader(in)
+	n := 0
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		rel := filepath.Clean(filepath.FromSlash(hdr.Name))
+		if strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			return fmt.Errorf("archive entry escapes target: %s", hdr.Name)
+		}
+		dst := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(f, tr); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
+		n++
+	}
+	fmt.Printf("restored %d file(s) into %s (worktrees are not restored; cases show STALE/INSUFFICIENT until re-verified)\n", n, root)
 	return nil
 }
