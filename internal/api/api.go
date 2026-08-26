@@ -152,6 +152,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /examples", s.protect(auth.ActView, s.listExamples))
 	mux.HandleFunc("POST /examples/{name}", s.protect(auth.ActCreate, s.runExample))
 	mux.HandleFunc("POST /tasks/{id}/cancel", s.protect(auth.ActCreate, s.cancelTask))
+	mux.HandleFunc("POST /tasks/{id}/reverify", s.protect(auth.ActCreate, s.reverifyTask))
 	mux.HandleFunc("GET /repos", s.protect(auth.ActView, s.listRepos))
 	mux.HandleFunc("POST /repos", s.protect(auth.ActManageRepos, s.addRepo))
 	mux.HandleFunc("POST /github/import", s.protect(auth.ActCreate, s.githubImport))
@@ -641,4 +642,18 @@ func (s *Server) getEffects(w http.ResponseWriter, r *http.Request) {
 		effs = []domain.ExternalEffect{}
 	}
 	writeJSON(w, http.StatusOK, effs)
+}
+
+func (s *Server) reverifyTask(w http.ResponseWriter, r *http.Request) {
+	t, err := s.Engine.Reverify(r.PathValue("id"))
+	if err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, engine.ErrNotReverifiable) {
+			code = http.StatusConflict
+		}
+		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+	s.runAsync(t.ID)
+	writeJSON(w, http.StatusAccepted, t)
 }

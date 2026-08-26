@@ -152,3 +152,34 @@ func TestStaleLeaseFromDeadWorkerDoesNotBlockRestart(t *testing.T) {
 		t.Fatalf("%s", got.Status)
 	}
 }
+
+// Re-verify after a later edit: the STALE packet is replaced by fresh
+// evidence bound to the new HEAD; old versions remain.
+func TestReverifyAfterEditProducesFreshEvidence(t *testing.T) {
+	tmp, repo, sc := crashScenario(t)
+	e := newTestEngine(t, sc, filepath.Join(tmp, "data"))
+	task, _ := e.CreateTaskSpec(TaskSpec{Goal: "Fix duplicate reservation", Repos: []string{repo}, ReproCommand: "go test -run " + tzTest + " ./..."})
+	if err := e.RunTask(context.Background(), task.ID); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(e.WS.Root, task.ID, "reservations", "store.go")
+	b, _ := os.ReadFile(wt)
+	os.WriteFile(wt, append(b, []byte("\n// later edit\n")...), 0o644)
+	v, _ := e.PacketState(task.ID)
+	if v.Packet.Verdict != domain.ClaimStale {
+		t.Fatalf("dirty edit → %s", v.Packet.Verdict)
+	}
+	if _, err := e.Reverify(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RunTask(context.Background(), task.ID); err != nil {
+		t.Fatal(err)
+	}
+	v2, _ := e.PacketState(task.ID)
+	if v2.Task.Status != domain.StatusDone || v2.Packet.Verdict != domain.ClaimSupported || v2.Packet.Version < 3 {
+		t.Fatalf("after re-verify: %s %s v%d (%s)", v2.Task.Status, v2.Packet.Verdict, v2.Packet.Version, v2.Packet.VerdictWhy)
+	}
+	if v2.Packet.Source.HeadSHAs["reservations"] == v.Packet.Source.HeadSHAs["reservations"] {
+		t.Fatal("re-verify did not commit the edit")
+	}
+}

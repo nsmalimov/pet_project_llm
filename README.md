@@ -8,6 +8,27 @@ events, agent runs and evidence — persisted on disk, resumable after restart.
 
 Written in Go, stdlib only. One binary, no external services.
 
+## Open the app (Local Pilot)
+
+```bash
+go build -o bin/orc ./cmd/orc
+./bin/orc serve --addr 127.0.0.1:8080 --data ./.orchestrator
+open http://127.0.0.1:8080
+```
+
+The app is a single embedded page over the real API: **Cases** (overview,
+decisions waiting), **New change case** (local repository or GitHub PR —
+shows "not connected" until credentials exist), **Case** (Proof packet ·
+Timeline · Packet history · Raw), **Repositories & settings** (execution
+mode and what is actually enforced), **Help** (what SUPPORTED / INSUFFICIENT
+/ STALE / CONTRADICTED / BLOCKED mean).
+
+"Load example" runs the embedded reservations fixture (a real timezone
+double-booking bug) through the **real** engine — worktree, baseline, `go
+test -v`, original-test replay, packet — with scripted agent replies. Such
+cases are labelled *Local Pilot example* everywhere. Real agents need the
+`claude` CLI; set `PROOFLINE_SANDBOX=SAFE_SANDBOX` (macOS) to confine them.
+
 ## Quick start
 
 ```bash

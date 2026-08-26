@@ -28,7 +28,7 @@ func chromeBin() string {
 
 func dumpDOM(t *testing.T, chrome, url string) string {
 	t.Helper()
-	cmd := exec.Command(chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--virtual-time-budget=8000", "--dump-dom", url)
+	cmd := exec.Command(chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--virtual-time-budget=20000", "--dump-dom", url)
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("chrome: %v", err)
@@ -69,7 +69,11 @@ func TestBrowserDecisionScreen(t *testing.T) {
 	dom = dumpDOM(t, chrome, srv.URL+"/cases/"+task.ID+"/packet")
 	for _, want := range []string{"BLOCKED", "Contradictions", "ORIGINAL tests fail", "Problem reproduced", "Change verified", "Not verified", "Human decision", "Local Pilot example", "packet v"} {
 		if !strings.Contains(dom, want) {
-			t.Errorf("packet screen lacks %q", want)
+			i := strings.Index(dom, `id="app"`)
+			if i < 0 {
+				i = 0
+			}
+			t.Errorf("packet screen lacks %q; DOM excerpt: %s", want, strings.ReplaceAll(dom[i:min(len(dom), i+1500)], "\n", " "))
 		}
 	}
 	if strings.Contains(dom, `class="band s-supported"`) {

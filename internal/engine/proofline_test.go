@@ -25,7 +25,7 @@ func fixtureRepo(t *testing.T, root string) string {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() == "embed.go" {
+		if !strings.HasSuffix(e.Name(), ".fixture") {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(src, e.Name()))
@@ -46,10 +46,7 @@ func fixtureRepo(t *testing.T, root string) string {
 
 func readFixture(t *testing.T, name string) string {
 	t.Helper()
-	if name == "go.mod" {
-		name = "go.mod.fixture"
-	}
-	b, err := os.ReadFile(filepath.Join("..", "..", "fixtures", "reservations", name))
+	b, err := os.ReadFile(filepath.Join("..", "..", "fixtures", "reservations", name+".fixture"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -511,3 +511,45 @@ func (e *Engine) bindSource(ctx context.Context, t *domain.Task, a *domain.Artif
 		}
 	}
 }
+
+var ErrNotReverifiable = errors.New("task is running or awaiting a decision; cannot re-verify now")
+
+// Reverify re-runs verification and independent review on the worktree as it
+// is now (after a later edit, a STALE packet, or a resumed task). Nothing is
+// invented: baseline stays, new test/review artifacts are bound to the
+// current HEAD and the packet gets a new version.
+func (e *Engine) Reverify(id string) (*domain.Task, error) {
+	t, err := e.Store.GetTask(id)
+	if err != nil {
+		return nil, err
+	}
+	if t.Status.Active() || t.Status == domain.StatusAwaitingDecision {
+		return nil, ErrNotReverifiable
+	}
+	if t.State.WorktreeRoot == "" {
+		return nil, errors.New("task has no worktree to verify")
+	}
+	// Commit whatever is in the worktree so the evidence binds to a SHA.
+	if commits, cerr := e.WS.Commit(context.Background(), t, "orc: re-verify current state"); cerr == nil && len(commits) > 0 {
+		t.State.Commits = commits
+	}
+	if diff, files, derr := e.WS.Diff(context.Background(), t); derr == nil {
+		t.State.ChangedFiles = files
+		if len(files) > 0 {
+			// The change under verification is whatever the tree holds now;
+			// bind a fresh diff artifact to the new HEAD.
+			e.addArtifact(t, domain.Artifact{
+				Kind: domain.ArtDiff, Title: fmt.Sprintf("change (re-verified): %d file(s)", len(files)), Producer: "engine.reverify",
+				Files: files, Diff: diff, Commits: t.State.Commits, Branch: t.State.Branch, Model: t.State.AuthorModel,
+			})
+		}
+	}
+	t.FailureReason = ""
+	t.State.FixAttempts, t.State.ReviewRounds = 0, 0
+	t.State.ResumeStatus = ""
+	if err := e.setStatus(t, domain.StatusVerifying); err != nil {
+		return nil, err
+	}
+	e.emit(t.ID, domain.EvStepPlanned, map[string]any{"action": "verify", "reason": "re-verification requested on the current worktree state"})
+	return t, nil
+}

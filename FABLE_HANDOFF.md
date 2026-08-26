@@ -5,6 +5,36 @@ VERIFIED** (code + partial test, or verified once by hand), **NOT VERIFIED**,
 **BLOCKED** (cannot be done in this environment). Nothing here is
 production-ready; see §9.
 
+## 0. Product slice (added after the foundation sprint)
+
+- Web app (`internal/api/ui.html`, SPA over the API): overview, new case
+  form (local / GitHub with honest "not connected"), case page with Proof
+  packet / Timeline (polling, cancel, resume) / Packet history (version
+  compare) / Raw, repositories & settings (exec mode + enforced
+  capabilities), help.
+- Local Pilot examples: `POST /examples/{name}` materialises the embedded
+  fixture (`fixtures`, `examples` packages), registers it, runs the real
+  engine with the `scenario` executor (scripted agent replies; everything
+  else real). VERIFIED: `TestExampleCaseEndToEndOverHTTP`,
+  `TestBrowserDecisionScreen` (headless Chrome DOM), manual restart check.
+- Cancel (`POST /tasks/{id}/cancel`) → INTERRUPTED with resume point —
+  VERIFIED `TestCancelOverHTTPLeavesInterrupted`.
+- Reviewer fixes applied from the P7 round (see FALSE_PROOF_REPORT.md and
+  git history): passing baseline without an explicit repro command is
+  INSUFFICIENT (not CONTRADICTED); pytest `-q` stripped before `-v`; failing
+  original-test replay feeds the fix loop; RecoverInterrupted never touches
+  a task whose lease is held; CAS conflicts stop the loop instead of
+  creating orphan decisions; event Seq / decisions / effects under the
+  cross-process lock; effects keyed by packet fingerprint; head refs
+  validated; idempotency keys namespaced by workspace and the replayed task
+  authorised; run/state summaries redacted; unknown author model ≠
+  independent; live (unpersisted) packet preview while running; webhook
+  imports refused in LOCAL_UNSAFE unless explicitly allowed.
+- Still open from the reviews: single shared webhook secret across
+  workspaces; keychain readable by the agent under SAFE_SANDBOX (needed for
+  CLI login — narrow when the CLI supports a file token); `TaskState`
+  duplicates artifact facts; `Confidence` legacy chain still in the API.
+
 ## 1. Architecture now
 
 Single Go binary `orc`, stdlib only, modular monolith:

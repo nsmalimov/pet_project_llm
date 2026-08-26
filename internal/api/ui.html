@@ -181,6 +181,7 @@ function renderCase(v,tab,events){
     <div class="why">${esc(active?'The engine is working; the claims below reflect evidence persisted so far and are not a verdict yet.':p.verdict_why)}</div>
     <div class="stats">source ${shaPair}${p.source.dirty?' · <b>uncommitted changes</b>':''} · packet ${p.live?'live preview':'v'+p.version} · ${esc(p.exec_mode||'')}</div>
     <div class="stats">${coreOk}/${core.length} core claims supported · ${p.contradictions.length?'<b>'+p.contradictions.length+' contradiction(s)</b> · ':''}<b>${p.gaps.length} not verified</b> · ${p.risks.length} risk(s) · ${lastV?'decision: <b>'+esc(lastV.decision.replace('_',' '))+'</b>'+(lastV.packet_version!==p.version?' <span style="color:var(--blk)">(on v'+lastV.packet_version+', now v'+p.version+')</span>':''):(active?'':'<b>human decision required</b>')}</div></div></div>
+  ${!active&&p.verdict==='stale'?`<div class="warnbox">Evidence predates the current code. <button onclick="reverifyCase('${t.id}')">Re-verify current state</button></div>`:''}
   ${p.contradictions.length?`<div class="panel contra"><h2>Contradictions — evidence says the opposite</h2><ul class="list">${p.contradictions.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:''}
   <div class="tabs">${['packet','timeline','history','raw'].map(x=>`<a href="/cases/${t.id}/${x}" class="${tab===x?'on':''}">${x==='packet'?'Proof packet':x==='timeline'?'Timeline':x==='history'?'Packet history ('+v.versions.length+')':'Raw'}</a>`).join('')}</div>
   <div class="panel" style="margin-top:0;border-radius:0 8px 8px 8px">`;
@@ -242,7 +243,7 @@ function renderTimeline(v,events){const t=v.task;const active=ACTIVE.has(t.statu
     case 'packet.built':txt=`proof packet v${d.version} built: <b>${esc(d.verdict)}</b>, ${d.gaps} gap(s)`;break;case 'verdict.recorded':txt=`human decision recorded: <b>${esc(d.decision)}</b> on packet v${d.packet_version}`;cls='ok';break;case 'policy.violation':txt='<b>BLOCKED by execution policy:</b> '+esc(d.error);cls='bad';break;case 'warning':txt='warning: '+esc(d.warning);break;case 'task.phase_changed':txt=`phase → <b>${esc(d.to)}</b>`;break;
     default:txt=esc(e.type)}
     return `<div class="it ${cls}"><div class="t">${new Date(e.at).toLocaleTimeString()} · #${e.seq}</div><div>${txt}</div></div>`}).join('');
-  const controls=`${active?`<button class="reject" onclick="cancelCase('${t.id}')">Cancel</button>`:''}${t.status==='interrupted'?`<button class="primary" onclick="resumeCase('${t.id}')">Resume</button>`:''}${t.status==='pending'?`<button class="primary" onclick="runCase('${t.id}')">Start</button>`:''}`;
+  const controls=`${active?`<button class="reject" onclick="cancelCase('${t.id}')">Cancel</button>`:''}${!active&&t.status!=='awaiting_decision'&&t.status!=='pending'?`<button onclick="reverifyCase('${t.id}')" title="re-run tests and independent review on the worktree as it is now; new packet version">Re-verify current state</button>`:''}${t.status==='interrupted'?`<button class="primary" onclick="resumeCase('${t.id}')">Resume</button>`:''}${t.status==='pending'?`<button class="primary" onclick="runCase('${t.id}')">Start</button>`:''}`;
   return `<h2>Progress <span class="small">${active?'<span class="live"></span>live (polling)':'finished'}</span></h2><div class="phase">${chips}</div>
   ${t.status==='awaiting_decision'?'<div class="warnbox">The engine is waiting for a human answer — see the Proof packet tab.</div>':''}${t.status==='interrupted'?'<div class="warnbox">Interrupted (cancel or restart). Nothing after the interruption counts as verified; resume to continue from the last phase.</div>':''}
   <div style="margin:8px 0">${controls}</div>
@@ -269,6 +270,7 @@ function toggle(id){open[id]=!open[id];const el=document.getElementById('ev-'+id
 async function decide(id,decision){const note=$('#note').value;try{await api('/tasks/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision,note,by:'ui',packet_version:window.__pv||0})});route()}catch(e){alert(e.message)}}
 async function resolve(id,did,opt){const note=($('#dnote-'+did)||{}).value||'';try{await api('/tasks/'+id+'/decisions/'+did+'/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({option:opt,note})});go('/cases/'+id+'/timeline')}catch(e){alert(e.message)}}
 async function cancelCase(id){try{await api('/tasks/'+id+'/cancel',{method:'POST'});route()}catch(e){alert(e.message)}}
+async function reverifyCase(id){try{await api('/tasks/'+id+'/reverify',{method:'POST'});go('/cases/'+id+'/timeline')}catch(e){alert(e.message)}}
 async function resumeCase(id){try{await api('/tasks/'+id+'/resume',{method:'POST'});route()}catch(e){alert(e.message)}}
 async function runCase(id){try{await api('/tasks/'+id+'/run',{method:'POST'});route()}catch(e){alert(e.message)}}
 

@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-//go:embed reservations/go.mod.fixture reservations/store.go reservations/store_test.go reservations/handler.go
+//go:embed reservations/*.fixture
 var Reservations embed.FS
 
 // Materialize writes the reservations fixture into dir and commits it as a
@@ -31,7 +31,7 @@ func Materialize(dir string) error {
 		if err != nil {
 			return err
 		}
-		name := strings.TrimSuffix(e.Name(), ".fixture") // go.mod is stored as go.mod.fixture so this dir is not a nested module
+		name := strings.TrimSuffix(e.Name(), ".fixture") // files carry a .fixture suffix so the buggy code is neither a nested module nor part of ./...
 		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
 			return err
 		}
